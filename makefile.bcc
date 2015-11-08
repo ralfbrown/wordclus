@@ -1,0 +1,58 @@
+# Compiler-specific definitions: Borland C++ under MS-DOS
+
+#########################################################################
+# define the compiler and its options
+
+CC = bcc
+CCLINK = $(CC)
+CFLAGS = -ml -3 -O2al -Z -V -k- -N- -v -vi -w -DPENTIUM -f87
+CFLAGEXE = -L$(LIBINSTDIR) -e$@
+LINKFLAGS =
+
+#########################################################################
+# define the object module librarian and its options
+
+LIBRARIAN = tlib
+LIBFLAGS = /c /p32
+LIBOBJS = @objs.lst
+# (objs.lst contains a list of all the object modules in $(OBJS) )
+
+#########################################################################
+# define the library indexer and its options
+
+LIBINDEXER =
+LIBIDXFLAGS =
+
+#########################################################################
+# define file copy/deletion/etc. programs
+
+# (note: makefile assumes 4DOS or other progs handling multiple files)
+RM = del
+CP = copy
+ZIP = pkzip
+ZIPFLAGS = -o -ex
+BITBUCKET = >NUL
+TOUCH = touch
+
+#########################################################################
+# define the various extensions in use
+
+OBJ = .obj
+EXE = .exe
+LIB = .lib
+C = .cpp
+
+#########################################################################
+# define the required libraries in the proper format for the OS
+
+USELIBS = $(LIBDIR)\ebmt$(LIB) $(LIBDIR)\framepac$(LIB)
+
+#########################################################################
+# define the default compile rule
+
+$(C)$(OBJ):
+	$(CC) $(CFLAGS) $(INCLUDEDIRS) -c $<
+
+#########################################################################
+
+# End of Makefile

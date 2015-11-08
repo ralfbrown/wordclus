@@ -1,0 +1,182 @@
+# Compiler-specific definitions: GCC under Linux (default: x86 architecture)
+
+ifndef BUILD_DBG
+### compile fully optimized for distribution
+BUILD_DBG=0
+### compile with debugging info
+#BUILD_DBG=1
+### compile with debugging info and all optimizations off
+#BUILD_DBG=2
+endif
+
+THREADS?=1
+#THREADS?=0
+
+ifndef PROFILE
+#PROFILE=-pg
+#PROFILE=-DPURIFY
+endif
+
+ifndef NODEBUG
+#NODEBUG = -DNDEBUG
+endif
+
+ifndef GDB
+#GDB = -ggdb3
+endif
+
+ifeq ($(SANE),1)
+SANITIZE=-fsanitize=thread -fPIE -DHELGRIND
+LINKSAN=-pie
+else ifeq ($(SANE),2)
+SANITIZE=-fsanitize=address -fno-omit-framepointer -DPURIFY
+else ifeq ($(SANE),3)
+SANITIZE=-fsanitize=leak -DPURIFY
+else ifeq ($(SANE),4)
+SANITIZE=-fsanitize=memory -fno-omit-framepointer
+else ifeq ($(SANE),5)
+SANITIZE=-fsanitize=undefined
+endif
+
+ifndef CPU
+## Uncomment the appropriate CPU type
+### 486
+#CPU=4
+### Pentium
+#CPU=5
+### PentiumPro or higher
+#CPU=6
+### AMD Athlon; not supported by GCC 2.x
+#CPU=7
+### AMD64/x86_64 CPUs in 64-bit mode; not supported by GCC 2.x
+###    (AMD K8 [Opteron/Athlon64], newest PentiumIV with EM64t)
+#CPU=8
+### AMD64 "PhenomII" (K10) or newer
+#CPU=10
+### Let GCC auto-determine CPU type, but assume at least CPU=8 capabilities
+CPU=99
+endif
+
+ifndef BITS
+#BITS=32
+BITS=64
+endif
+
+ifeq ($(THREADS),1)
+  PTHREAD=-pthread -DFrMULTITHREAD
+else
+  PTHREAD=
+endif
+
+WARN=-Wall -Wno-deprecated -Wextra
+# -Wshadow -Wcast-align -Wmissing-noreturn -Wmissing-format-attribute
+# -Wno-multichar -Wpacked -Wdisabled-optimization -Wpadded
+
+# explicitly force includes to check here first, to fix an incompatibility
+#   with the templated iostreams (they don't have many of the functions
+#   present in the old iostream)
+#EXTRAINC=-I/usr/include/g++-3/
+
+LINKBITS=-m$(BITS)
+ifeq ($(CPU),99)
+  # auto-detection, assuming at least AMD "K8" level of features (any
+  #  x64 processor qualifies); required GCC 4.2+
+  CPUDEF=-march=native -D__886__ -D__BITS__=$(BITS)
+else ifeq ($(CPU),10)
+  # newest AMD chips: "Barcelona", PhenomII
+  CPUDEF=-march=amdfam10 -D__886__ -D__BITS__=$(BITS)
+else ifeq ($(CPU),8)
+  CPUDEF=-march=k8 -msse -D__BITS__=$(BITS)
+else ifeq ($(CPU),7)
+  CPUDEF=-march=athlon-xp -mmmx
+else ifeq ($(CPU),6)
+  CPUDEF=-march=i$(CPU)86 -mtune=i$(CPU)86 -mmmx
+else
+  CPUDEF=-march=i$(CPU)86 -mtune=i$(CPU)86
+endif
+ifneq ($(CPU),99)
+CPUDEF += -D__$(CPU)86__
+endif
+
+#########################################################################
+# define the compiler and its options
+
+#CC = g++ --std=c++11
+CC = g++
+CCLINK=$(CC)
+CFLAGS= $(WARN)
+CFLAGS +=$(CPUDEF)
+CFLAGS +=$(PTHREAD)
+CFLAGS +=$(PROFILE)
+CFLAGS +=$(NODEBUG)
+CFLAGS +=$(LINKBITS)
+CFLAGS +=$(EXTRAINC)
+CFLAGS +=$(SANITIZE)
+CFLAGS +=$(INCLUDEDIRS)
+CFLAGS +=$(SHAREDLIB)
+CFLAGS +=$(COMPILE_OPTS)
+CFLAGEXE = -L$(LIBINSTDIR) $(PROFILE) -o $@
+LINKFLAGS = $(LINKBITS)
+LINKFLAGS +=$(LINKTYPE)
+LINKFLAGS +=$(PTHREAD)
+LINKFLAGS +=$(SANITIZE)
+LINKFLAGS +=$(LINKSAN)
+
+ifeq ($(BUILD_DBG),2)
+  CFLAGS += -ggdb3 -O0 -fno-inline -g3
+else
+ifeq ($(BUILD_DBG),1)
+  CFLAGS += -ggdb3 -O -g3
+else
+  CFLAGS += -O3 -fexpensive-optimizations -g$(DBGLVL) $(GDB)
+endif
+endif
+
+#########################################################################
+# define the object module librarian and its options
+
+LIBRARIAN = ar
+LIBFLAGS = rucl
+LIBOBJS = $(OBJS)
+
+#########################################################################
+# define the library indexer and its options
+
+LIBINDEXER = ranlib
+LIBIDXFLAGS = $(LIBRARY)
+
+#########################################################################
+# define file copy/deletion/etc. programs
+
+RM = rm -f
+CP = cp -p
+ZIP = zip
+ZIPFLAGS = -qo9
+BITBUCKET = >&/dev/null
+TOUCH = touch
+
+#########################################################################
+# define the various extensions in use
+
+OBJ = .o
+EXE = 
+LIB = .a
+C = .C
+
+#########################################################################
+# define the required libraries in the proper format for the OS
+
+#USELIBS = -lebmt -lframepac -lcrypt
+USELIBS = -lframepac
+
+#########################################################################
+# define the default compile rule
+
+$(C)$(OBJ): ; $(CC) $(CFLAGS) $(INCLUDEDIRS) -c $<
+.cpp.C: ; ln -s $< $@
+
+.SUFFIXES: $(OBJ) .C $(C) .cpp
+
+#########################################################################
+
+# End of Makefile

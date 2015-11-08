@@ -1,0 +1,72 @@
+# Compiler-specific definitions: Watcom C++ under MS-DOS
+
+#########################################################################
+# additional location setups required by Watcom's difference commandline
+# parsing
+
+# where to put the compiled library and required header files
+INSTDIR = $(TOP)\include
+LIBINSTDIR = $(TOP)\lib
+# where to look for header files from other modules when compiling
+INCLUDEDIRS = -i=$(TOP)\include
+# where to look for library files when linking
+LIBDIR = $(TOP)\lib
+
+#########################################################################
+# define the compiler and its options
+
+DBGLVL=2       # debugging: 0=none, 1=lines only, 2=full
+
+CC = wpp386
+CCLINK = wcl386
+CFLAGS = -zq -onatxle=3 -fp5 -5r -wx -mf -d$(DBGLVL)
+CFLAGEXE = -l=dos4g -d$(DBGLVL)
+LINKFLAGS =
+
+#########################################################################
+# define the object module librarian and its options
+
+LIBRARIAN = wlib
+LIBFLAGS = -q -c -p=64
+LIBOBJS = @objs.lst
+# (objs.lst contains a list of all the object modules in $(OBJS) )
+
+#########################################################################
+# define the library indexer and its options
+
+LIBINDEXER =
+LIBIDXFLAGS =
+
+#########################################################################
+# define file copy/deletion/etc. programs
+
+# (note: makefile assumes 4DOS or other progs handling multiple files)
+RM = del
+CP = copy
+ZIP = pkzip
+ZIPFLAGS = -o -ex
+BITBUCKET = >NUL
+TOUCH = touch
+
+#########################################################################
+# define the various extensions in use
+
+OBJ = .obj
+EXE = .exe
+LIB = .lib
+C = .cpp
+
+#########################################################################
+# define the required libraries in the proper format for the compiler/OS
+
+USELIBS = $(LIBDIR)\ebmt$(LIB) $(LIBDIR)\framepac$(LIB)
+
+#########################################################################
+# define the default compile rule
+
+$(C)$(OBJ):
+       $(CC) $* $(CFLAGS) $(INCLUDEDIRS)
+
+#########################################################################
+
+# End of Makefile
