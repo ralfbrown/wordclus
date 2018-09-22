@@ -1,35 +1,40 @@
 /****************************** -*- C++ -*- *****************************/
 /*									*/
-/*  WordClust -- Bilingual Word Clustering				*/
-/*  Version 1.40							*/
+/*  WordClust -- Word Clustering					*/
+/*  Version 2.00							*/
 /*	 by Ralf Brown							*/
 /*									*/
 /*  File: wcbatch.C	      batch-of-lines processing			*/
-/*  LastEdit: 08nov2015							*/
+/*  LastEdit: 21sep2018							*/
 /*									*/
-/*  (c) Copyright 2015 Ralf Brown/Carnegie Mellon University		*/
-/*	This program is free software; you can redistribute it and/or	*/
-/*	modify it under the terms of the GNU Lesser General Public 	*/
-/*	License as published by the Free Software Foundation, 		*/
-/*	version 3.							*/
+/*  (c) Copyright 2015,2016,2017,2018 Carnegie Mellon University	*/
+/*	This program may be redistributed and/or modified under the	*/
+/*	terms of the GNU General Public License, version 3, or an	*/
+/*	alternative license agreement as detailed in the accompanying	*/
+/*	file LICENSE.  You should also have received a copy of the	*/
+/*	GPL (file COPYING) along with this program.  If not, see	*/
+/*	http://www.gnu.org/licenses/					*/
 /*									*/
 /*	This program is distributed in the hope that it will be		*/
 /*	useful, but WITHOUT ANY WARRANTY; without even the implied	*/
 /*	warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR		*/
-/*	PURPOSE.  See the GNU Lesser General Public License for more 	*/
-/*	details.							*/
-/*									*/
-/*	You should have received a copy of the GNU Lesser General	*/
-/*	Public License (file COPYING) and General Public License (file	*/
-/*	GPL.txt) along with this program.  If not, see			*/
-/*	http://www.gnu.org/licenses/					*/
+/*	PURPOSE.  See the GNU General Public License for more details.	*/
 /*									*/
 /************************************************************************/
 
-#include "FramepaC.h"
 #include "wordclus.h"
 #include "wcbatch.h"
-#include "wcglobal.h"
+#include "wcparam.h"
+
+#include "framepac/file.h"
+#include "framepac/texttransforms.h"
+#include "framepac/threadpool.h"
+
+using namespace Fr ;
+
+#include <chrono>
+
+using namespace std ;
 
 /************************************************************************/
 /*	Types for this module						*/
@@ -38,9 +43,9 @@
 class WcWorkOrder
    {
    public:
-      WcLineBatch        *lines ;
-      WcProcessFileFunc  *fn ;
-      const WcParameters *params ;
+      LineBatch*          lines ;
+      WcProcessFileFunc*  fn ;
+      const WcParameters* params ;
       va_list	          args ;
       bool		  success ;
       volatile bool	  in_use ;
@@ -58,50 +63,9 @@ class WcWorkOrder
 /*	Globals							        */
 /************************************************************************/
 
-static FrCriticalSection critsect ;
-
-static char *word_delimiters = nullptr ;
-
 /************************************************************************/
 /*	External Functions						*/
 /************************************************************************/
-
-/************************************************************************/
-/*	Helper functions						*/
-/************************************************************************/
-
-const char *WcWordDelimiters()
-{
-   return word_delimiters ;
-}
-
-//----------------------------------------------------------------------
-
-void WcSetWordDelimiters(const char *delim)
-{
-   if (delim)
-      {
-      word_delimiters = FrNewN(char,256) ;
-      if (word_delimiters)
-	 {
-	 memcpy(word_delimiters,delim,256) ;
-	 }
-      }
-   else
-      {
-      FrFree(word_delimiters) ;
-      word_delimiters = nullptr ;
-      }
-   return ;
-}
-
-//----------------------------------------------------------------------
-
-void WcClearWordDelimiters()
-{
-   WcSetWordDelimiters(0) ;
-   return ;
-}
 
 /************************************************************************/
 /*	Methods for class WcWorkOrder					*/
@@ -109,7 +73,7 @@ void WcClearWordDelimiters()
 
 bool WcWorkOrder::inUse() const
 {
-   critsect.loadBarrier() ;
+   atomic_thread_fence(std::memory_order_acquire) ; // load barrier
    return in_use ;
 }
 
@@ -118,7 +82,7 @@ bool WcWorkOrder::inUse() const
 void WcWorkOrder::markAvailable()
 {
    in_use = false ;
-   critsect.storeBarrier() ;
+   atomic_thread_fence(std::memory_order_release) ; // store barrier
    return ;
 }
 
@@ -127,81 +91,8 @@ void WcWorkOrder::markAvailable()
 void WcWorkOrder::markUsed()
 {
    in_use = true ;
-   critsect.storeBarrier() ;
+   atomic_thread_fence(std::memory_order_release) ; // store barrier
    return ;
-}
-
-/************************************************************************/
-/*	Methods for class WcLineBatch					*/
-/************************************************************************/
-
-WcLineBatch::WcLineBatch()
-{
-   m_numlines = 0 ;
-   for (size_t i = 0 ; i < lengthof(m_lines); ++i)
-      {
-      m_lines[i] = nullptr ;
-      m_altlines[i] = nullptr ;
-      m_tags[i] = nullptr ;
-      }
-   return ;
-}
-
-//----------------------------------------------------------------------
-
-void WcLineBatch::clear()
-{ 
-   for (size_t i = 0 ; i < numLines() ; ++i)
-      {
-      FrFree(m_lines[i]) ;
-      m_lines[i] = nullptr ;
-      FrFree(m_altlines[i]) ;
-      m_altlines[i] = nullptr ;
-      FrFree(m_tags[i]) ;
-      m_tags[i] = nullptr ;
-      }
-   m_numlines = 0 ;
-   return ;
-}
-
-//----------------------------------------------------------------------
-
-bool WcLineBatch::fill(FILE *fp, bool /*monoling*/, bool /*reverse_langs*/, int mono_skip,
-		       bool downcase_source, unsigned char *charmap, const char *delim)
-{
-   while (!feof(fp) && numLines() < maxLines())
-      {
-      // read the next line from the file
-      if (mono_skip < 0)		// skip the first member of each sentence pair
-	 {
-	 char *sent = FrReadCanonLine(fp,true,char_encoding,&Unicode_bswap,0,false,
-				      charmap,delim);
-	 FrFree(sent) ;
-	 }
-      char *ssent = FrReadCanonLine(fp,true,char_encoding,&Unicode_bswap,0,false,
-				    charmap,delim) ;
-      if (mono_skip > 0)		// skip second member of each sentence pair
-	 {
-	 char *sent = FrReadCanonLine(fp,true,char_encoding,&Unicode_bswap,0,false,
-				      charmap,delim);
-	 FrFree(sent) ;
-	 }
-      if (ssent)
-	 {
-	 if (*ssent)
-	    {
-	    if (downcase_source)
-	       {
-	       Fr_strlwr(ssent,char_encoding) ;
-	       }
-	    m_lines[numLines()] = ssent ;
-	    ++m_numlines ;
-	    }
-	 else
-	    FrFree(ssent) ;
-	 }
-      }
-   return numLines() >= maxLines() ;
 }
 
 /************************************************************************/
@@ -209,13 +100,13 @@ bool WcLineBatch::fill(FILE *fp, bool /*monoling*/, bool /*reverse_langs*/, int 
 
 static void process_file_segment(const void *input, void * /*output*/)
 {
-   FrSymHashTable::registerThread() ;
-   FrSymCountHashTable::registerThread() ;
    WcWorkOrder *order = (WcWorkOrder*)input ;
    if (order->fn)
       order->success = order->fn(*order->lines,order->params,order->args) ;
    else
       order->success = false ;
+   delete order->lines ;
+   order->lines = nullptr ;
    order->markAvailable() ;
    return ;
 }
@@ -234,73 +125,49 @@ static int available_order(const WcWorkOrder *orders, size_t num_orders)
 
 //----------------------------------------------------------------------
 
-static bool active_orders(const WcWorkOrder *orders, size_t num_orders)
+bool WcProcessFile(CFile& fp, const WcParameters *params, WcProcessFileFunc *fn, ...)
 {
-   for (size_t i = 0 ; i < num_orders ; ++i)
-      {
-      if (orders[i].inUse())
-	 return true ;
-      }
-   return false ;
-}
-
-//----------------------------------------------------------------------
-
-bool WcProcessFile(FILE *fp, const WcParameters *params, WcProcessFileFunc *fn, ...)
-{
-   if (!fp || !fp || !params)
+   if (!fp || !fn || !params)
       return false ;
-   bool downcase_source = params->downcaseSource() ;
-//!!!   bool dc_keep_case = DcKeepCase(!downcase_source) ;
-   unsigned char *charmap = nullptr ;
-   const char *delim = WcWordDelimiters() ;
-   bool success = true ;
    va_list args ;
    va_start(args,fn) ;
-   size_t num_threads = params->numThreads() ; 
-   FrThreadPool *tpool = params->threadPool() ? params->threadPool() : new FrThreadPool(num_threads) ;
-   bool must_wait = num_threads == 0 ;
-   WcWorkOrder orders[2*num_threads+1] ;
-   size_t num_orders = lengthof(orders) ;
-   while (!feof(fp))
+   ThreadPool *tpool = ThreadPool::defaultPool() ;
+   // allocate enough request packets to allow a queue to form for
+   //   each thread to avoid task switches, but not so many that we end
+   //   up wasting memory
+   size_t num_orders = 3 * tpool->numThreads() + 4 ;
+   WcWorkOrder orders[num_orders] ;
+   bool success = true ;
+   std::locale* encoding = WcCurrentCharEncoding() ;
+   while (!fp.eof())
       {
-      WcLineBatch *lines = new WcLineBatch ;
+      LineBatch *lines = fp.getLines(WcLINES_PER_BATCH,params->monoSkip()) ;
       if (!lines)
 	 break ;
-      bool monoling = params->monolingualOnly() ;
-      int mono_skip = params->monoSkip() ;
-      lines->fill(fp,monoling,reverse_languages,mono_skip,downcase_source,charmap,delim) ;
-      int ordernum ;
-      while (true)
+      if (params->downcaseSource())
 	 {
-	 ordernum = available_order(orders,num_orders) ;
-	 if (ordernum >= 0)
-	    break ;
-	 FrThreadSleep(100000) ; // wait 1/10 second, then retry
+	 for (char* line : *lines)
+	    {
+	    lowercase_string(line,encoding) ;
+	    }
+	 }
+      int ordernum ;
+      while ((ordernum = available_order(orders,num_orders)) < 0)
+	 {
+	 // wait 1/20 second, then retry
+	 this_thread::sleep_for(chrono::milliseconds(50)) ;
 	 }
       orders[ordernum].reset() ;
       orders[ordernum].lines = lines ;
       orders[ordernum].params = params ;
       orders[ordernum].fn = fn ;
-      FrCopyVAList(orders[ordernum].args,args) ;
+      va_copy(orders[ordernum].args,args) ;
       orders[ordernum].success = false ;
       orders[ordernum].markUsed() ;
-      tpool->dispatch(&process_file_segment,&orders[ordernum],0) ;
+      tpool->dispatch(&process_file_segment,&orders[ordernum],nullptr) ;
       }
-   while (active_orders(orders,num_orders))
-      {
-      FrThreadSleep(250000) ; // sleep for a quarter second
-      }
-   if (must_wait)
-      {
-      tpool->waitUntilIdle() ;
-      }
+   tpool->waitUntilIdle() ;
    va_end(args) ;
-   if (!params->threadPool())
-      {
-      delete tpool ;
-      }
-//!!!   (void)DcKeepCase(dc_keep_case) ;
    return success ;
 }
 

@@ -1,37 +1,50 @@
 /************************************************************************/
 /*									*/
-/*  WordClust -- Bilingual Word Clustering				*/
-/*  Version 1.40							*/
+/*  WordClust -- Word Clustering					*/
+/*  Version 2.00							*/
 /*	 by Ralf Brown							*/
 /*									*/
 /*  File: wcmain.cpp	      word clustering (main program)		*/
-/*  LastEdit: 08nov2015							*/
+/*  LastEdit: 21sep2018							*/
 /*									*/
-/*  (c) Copyright 1999,2000,2001,2002,2005,2006,2008,2009,2010,2015	*/
-/*		 Ralf Brown/Carnegie Mellon University			*/
-/*	This program is free software; you can redistribute it and/or	*/
-/*	modify it under the terms of the GNU Lesser General Public 	*/
-/*	License as published by the Free Software Foundation, 		*/
-/*	version 3.							*/
+/*  (c) Copyright 1999,2000,2001,2002,2005,2006,2008,2009,2010,2015,	*/
+/*		2016,2017,2018 Carnegie Mellon University		*/
+/*	This program may be redistributed and/or modified under the	*/
+/*	terms of the GNU General Public License, version 3, or an	*/
+/*	alternative license agreement as detailed in the accompanying	*/
+/*	file LICENSE.  You should also have received a copy of the	*/
+/*	GPL (file COPYING) along with this program.  If not, see	*/
+/*	http://www.gnu.org/licenses/					*/
 /*									*/
 /*	This program is distributed in the hope that it will be		*/
 /*	useful, but WITHOUT ANY WARRANTY; without even the implied	*/
 /*	warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR		*/
-/*	PURPOSE.  See the GNU Lesser General Public License for more 	*/
-/*	details.							*/
-/*									*/
-/*	You should have received a copy of the GNU Lesser General	*/
-/*	Public License (file COPYING) and General Public License (file	*/
-/*	GPL.txt) along with this program.  If not, see			*/
-/*	http://www.gnu.org/licenses/					*/
+/*	PURPOSE.  See the GNU General Public License for more details.	*/
 /*									*/
 /************************************************************************/
 
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
+
 #include "wordclus.h"
 #include "wcbatch.h"
-#include "wcglobal.h"
+#include "wcpair.h"
+#include "wctrmvec.h"
+#include "wcparam.h"
+
+#include "framepac/cluster.h"
+#include "framepac/fasthash64.h"
+#include "framepac/file.h"
+#include "framepac/memory.h"
+#include "framepac/progress.h"
+#include "framepac/stringbuilder.h"
+#include "framepac/symboltable.h"
+#include "framepac/texttransforms.h"
+#include "framepac/timer.h"
+#include "framepac/wordcorpus.h"
+
+using namespace Fr ;
 
 /************************************************************************/
 /*	Manifest Constants						*/
@@ -44,368 +57,738 @@
 #  define EXIT_FAILURE 1
 #endif
 
+#define DOT_INTERVAL 200000
+
+/************************************************************************/
+/*	Types for this module						*/
+/************************************************************************/
+
+class WcContext
+   {
+   public:
+      WcContext(const WcWordCorpus*, int dir, unsigned leftcontext) ;
+      ~WcContext() {}
+
+      const WcWordCorpus* corpus() const { return m_corpus ; }
+      size_t occurrences() const { return m_occurrences ; }
+      size_t wordCount() const { return m_numIDs ; }
+      size_t contextSize() const { return m_contextlength ; }
+      WcWordCorpus::ID contextID(size_t N) { return N < m_numIDs ? m_ids[N] : -1 ; }
+      WcWordCorpus::ID canonContextID(size_t N) { return N < m_contextlength ? m_canon_ids[N] : -1 ; }
+      bool sameContext(size_t loc) const ;
+      void addOccurrence() { m_occurrences++ ; }
+      void addLeftContext(WcWordCorpus::Index loc, const WcParameters* params,
+			  WcIDCountHashTable& counts) ;
+      void addRightContext(WcWordCorpus::Index loc, const WcParameters* params,
+			   WcIDCountHashTable& counts) ;
+      void updateCounts(WcIDCountHashTable& counts) ;
+
+   protected:
+      // it's OK to make the arrays ridiculously large to avoid dynamic allocation,
+      //   since we'll only ever have two instances per thread unless splitting
+      //   term vectors by context
+      WcWordCorpus::ID  m_ids[100] ;
+      WcWordCorpus::ID	m_canon_ids[10] ;
+      const WcWordCorpus* m_corpus ;
+      size_t            m_numIDs ;
+      size_t            m_contextlength ;
+      size_t            m_occurrences ;
+      unsigned	        m_leftcontext ;
+      int	        m_direction ;
+   protected: //methods
+      bool makeLeftContext(size_t loc, const WcParameters*) ;
+      bool makeRightContext(size_t loc, const WcParameters*) ;
+   } ;
+
+//----------------------------------------------------------------------
+
+struct CtxtVecInfo
+   {
+   const WcParameters* params ;
+   const WcWordCorpus* corpus ;
+   SymHashTable* ht ;
+   } ;
+
+//----------------------------------------------------------------------
+
+class tvContextInfo : public Object
+   {
+   public:
+      WcContext left ;
+      WcContext right ;
+      ScopedObject<WcIDCountHashTable> counts;
+      size_t freq ;
+   public:
+      tvContextInfo(const WcWordCorpus* corpus, size_t context, size_t left_context, size_t right_context)
+	 : left(corpus,-1,context-left_context),
+	   right(corpus,+1,context-right_context),
+	   counts(), freq(1)
+	 {
+	 }
+      virtual ~tvContextInfo() {}
+
+      void incrFreq() { freq++ ; }
+   } ;
+
+//----------------------------------------------------------------------
+
+class CtxtKey : public Object
+   {
+   public:
+      CtxtKey() { rewind() ; }
+      CtxtKey(const CtxtKey* orig)
+	 {
+	    rewind() ;
+	    if (orig)
+	       {
+	       m_active = orig->m_active ;
+	       std::copy(orig->m_ids,orig->m_ids+m_active,m_ids) ;
+	       }
+	 }
+      ~CtxtKey() {}
+
+      size_t hashValue() const
+	 {
+	    unsigned long hash = 1 ;
+	    for (size_t i = 0 ; i < m_active ; i++)
+	       {
+	       hash = (hash >> 5) | (hash << ((sizeof(hash)*8) - 5)) ;
+	       hash ^= m_ids[i] ;
+	       }
+	    return hash ;
+	 }
+      bool equal(const Object* obj) const
+	 {
+	    // only works with other objects of our type!
+	    const CtxtKey* other = static_cast<const CtxtKey*>(obj) ;
+	    if (other->m_active != m_active) return false ;
+	    return memcmp(m_ids,other->m_ids,m_active*sizeof(m_ids[0])) == 0 ;
+	 }
+      Object* clone() const { return new CtxtKey(this) ; }
+      Object* shallowCopy() const { return clone() ; }
+
+      void addID(WcWordCorpus::ID id) { m_ids[m_active++] = id ; }
+      void rewind() { m_active = 0 ; }
+      WcWordCorpus::ID nextID() { return m_ids[m_active++] ; }
+
+   protected:
+      WcWordCorpus::ID m_ids[6] ; // max 3 on left and 3 on right
+      uint8_t        m_active ;
+
+   } ;
+
 /************************************************************************/
 /*	Global variables						*/
 /************************************************************************/
 
-static size_t num_examples = 0 ;
-
-#ifndef NDEBUG
-#  undef _FrCURRENT_FILE
-   static const char _FrCURRENT_FILE[] = __FILE__ ;
-#endif /* !NDEBUG */
+static Ptr<ProgressIndicator> progress ;
 
 /************************************************************************/
 /*	External Functions						*/
 /************************************************************************/
 
-FrList *EbExtractAlignTag(const char *tags) ;
-FrList *EbStripMorph(FrList *words, FrCharEncoding enc) ;
-char *WcStripCoindex(const char *word, FrCharEncoding encoding) ;
-
 /************************************************************************/
+/*	Helper functions						*/
 /************************************************************************/
 
-// avoid pulling in unneeded parts of the EBMT machinery by defining some
-//   dummy functions
-int perform_EBMT_operation(FrObject *, ostream &, istream &)
+static bool tokenized_word(const char *context, WcWordCorpus::ID &token,
+			   const WcWordCorpus *corpus, bool auto_numbers)
 {
-   return false ;
-}
-
-/************************************************************************/
-/************************************************************************/
-
-
-static void WcShowProgress(size_t &count, size_t incr, size_t interval, const char *line_prefix,
-			   bool run_verbosely = true)
-{
-   if (!run_verbosely)
-      return ;
-   size_t prev_intervals = count / interval ;
-   count += incr ;
-   size_t curr_intervals = count / interval ;
-   if (curr_intervals > prev_intervals)
+   WcWordCorpus::ID id = corpus->getContextID(context) ;
+   if (id != WcWordCorpus::ErrorID)
       {
-      if (curr_intervals % 50 == 0)
-	 {
-	 if (showmem)
-	    {
-	    FrMemoryStats() ;
-	    }
-	 cout << endl << line_prefix << (char)('0' + ((curr_intervals / 50) % 10)) << flush  ;
-	 }
-      cout << "." << flush ;
-      }
-   return ;
-}
-
-//----------------------------------------------------------------------
-
-static bool clear_disambiguation(const FrSymbol *sym, FrNullObject, va_list)
-{
-   FrSymbol *symbol = const_cast<FrSymbol*>(sym) ;
-   FrFree((void*)symbol->symbolFrame()) ;
-   symbol->setFrame(0) ;
-   return true ;
-}
-
-//----------------------------------------------------------------------
-
-void WcClearDisambigData()
-{
-   FrSymbolTable *symtab = FrSymbolTable::current() ;
-   if (symtab)
-      symtab->iterate(clear_disambiguation) ;
-   return ;
-}
-
-//----------------------------------------------------------------------
-
-static bool is_punctuation(const char *word)
-{
-   if (Fr_ispunct(word[0]) && word[1] == '\0')
+      token = id ;
       return true ;
+      }
+   if (auto_numbers && is_number(context))
+      {
+      token = corpus->numberToken() ;
+      return true ;
+      }
    return false ;
 }
 
 //----------------------------------------------------------------------
 
-static FrList *remove_punctuation(FrList *wordlist)
+void WcRemoveAutoClustersFromSeeds(SymHashTable *seeds)
 {
-   FrList *result ;
-   FrList **end = &result ;
-   while (wordlist)
+   if (seeds)
       {
-      FrObject *word = poplist(wordlist) ;
-      if (word && is_punctuation(word->printableName()))
-	 free_object(word) ;
-      else
-	 result->pushlistend(word,end) ;
+      for (const auto entry : *seeds)
+	 {
+	 Symbol* cluster = static_cast<Symbol*>(entry.second) ;
+	 if (ClusterInfo::isGeneratedLabel(cluster))
+	    seeds->remove(entry.first) ;
+	 }
       }
-   *end = nullptr ;			// terminate the list
-   return result ;
+   return ;
+}
+
+/************************************************************************/
+/*	Methods for class WcWordIDPair					*/
+/************************************************************************/
+
+unsigned long WcWordIDPair::hashValue() const
+{
+   FastHash64 hash ;
+   hash += m_word1 ;
+   hash += m_word2 ;
+   return (unsigned long)(*hash) ;
 }
 
 //----------------------------------------------------------------------
 
-static bool analyze_context_mono_batch(const WcLineBatch &lines, const WcParameters *params,
-				       va_list args)
-
+bool WcWordIDPair::equal(const WcWordIDPair& other) const
 {
-   FrVarArg(FrSymHashTable *,ht) ;
-   FrVarArg2(bool,int,run_verbosely) ;
-   const FrSymHashTable *desired_words = params->desiredWords() ;
-   FrCharEncoding enc = params->downcaseSource() ? char_encoding : FrChEnc_RawOctets ;
-   const FrObjHashTable *equivs = params->equivalenceClasses() ;
-   WcWordPairTable *mutualinfo = params->mutualInfo() ;
-   for (size_t i = 0 ; i < lines.numLines() ; ++i)
+   return m_word1 == other.m_word1 && m_word2 == other.m_word2 ;
+}
+
+/************************************************************************/
+/*	Methods for class WcContext					*/
+/************************************************************************/
+
+WcContext::WcContext(const WcWordCorpus* corp, int dir, unsigned lcontext) :
+   m_corpus(corp), m_numIDs(0), m_contextlength(0), m_occurrences(0),
+   m_leftcontext(lcontext), m_direction(dir)
+{
+#if 0
+   // we don't actually need to clear the ID and symbol arrays, but doing so makes
+   //   it easier to look at the structure in a debugger
+   std::fill(m_ids,m_ids+lengthof(m_ids),0) ;
+   std::fill(m_canon_ids,m_canon_ids+lengthof(m_canon_ids),0) ;
+#endif
+   return ;
+}
+
+//----------------------------------------------------------------------
+
+bool WcContext::sameContext(size_t loc) const
+{
+   if (m_numIDs == 0)
+      return false ;			// we haven't yet seen a previous context, so always different
+   for (size_t i = 0 ; i < m_numIDs ; ++i)
       {
-      const char *line = lines.line(i) ;
-      FrList *swords = FrCvtSentence2Wordlist(line) ;
-      if (exclude_punctuation)
-	 swords = remove_punctuation(swords) ;
-      size_t minphrase = params->allLengths() ? 1 : params->phraseLength() ;
-      FrArray *source_array ;
-      FrArray *tokenized_array ;
-      unsigned *coverage ;
-      unsigned max_coverage = params->maxEquivLength() ;
-      if (WcPrepContextMono(swords,enc,source_array,tokenized_array,coverage,max_coverage,
-			    minphrase,equivs,params->autoNumbers(),params->haveMarkup()))
+      if (m_corpus->getID(loc+i) != m_ids[i])
 	 {
-	 for (size_t phrlen = minphrase ; phrlen <= params->phraseLength() ; phrlen++)
-	    {
-	    WcAnalyzeContextMono(*source_array,*tokenized_array,coverage,max_coverage,
-				 params->src_context_left, params->src_context_right,
-				 phrlen,params->miThreshold(),ht,desired_words,mutualinfo,1) ;
-	    }
-	 delete source_array ;
-	 delete tokenized_array ;
-	 FrFree(coverage) ;
+	 return false ;
 	 }
       }
-   WcShowProgress(num_examples,lines.numLines(),2000,";   ",run_verbosely) ;
    return true ;
 }
 
 //----------------------------------------------------------------------
 
-static void analyze_context(const char *filename, const WcParameters *params,
-			    const char *delim, FrSymHashTable *ht)
+void WcContext::updateCounts(WcIDCountHashTable& counts)
 {
-   assertq(ht != nullptr) ;
-   FrElapsedTimer etimer ;
-   FrTimer timer ;
-   FILE *fp = WcOpenCorpus(filename) ;
-   if (!fp)
+   if (!occurrences())
       return ;
-   if (verbose)
-      cout << ";   " << flush ;
-   if (!delim)
-      delim = FrStdWordDelimiters(char_encoding) ;
-   WcProcessFile(fp,params,&analyze_context_mono_batch,ht,verbose) ;
-   WcCloseCorpus(fp) ;
-   if (verbose)
+   for (int i = 0 ; i < (int)contextSize() ; ++i)
       {
-      cout << "\n;  [ Processed " << filename << " in " << etimer.read100ths() << "s, "
-	   << timer.readsec() << " CPU seconds ]" << endl ;
+      WcWordCorpus::ID pos_id = corpus()->positionalID(m_canon_ids[i],m_direction*(i+1)) ;
+      counts.addCount(pos_id,occurrences()) ;
       }
-   return ;
-}
-
-/************************************************************************/
-/************************************************************************/
-
-void apply_WordClus_configuration(WcConfig *config)
-{
-   if (config)
-      wc_vars.applyConfiguration(config) ;
+   m_occurrences = 0 ;
    return ;
 }
 
 //----------------------------------------------------------------------
 
-static void analyze_files(const FrList *filelist, const WcParameters *params,
-			  FrSymHashTable *key_words, const char *delim)
+static size_t find_context_term(const WcWordCorpus* corpus, size_t loc, const WcParameters* params,
+				  WcWordCorpus::ID& token)
 {
-   FrElapsedTimer etimer ;
-   FrTimer timer ;
-   for (const FrList *files = filelist ; files ; files = files->rest())
+   size_t max = corpus->longestContextEquiv() ;
+   if (loc + max > corpus->corpusSize())
+      max = corpus->corpusSize() - loc ;
+   size_t longest_match(0) ;
+   if (max)
       {
-      const char *filename = 
-	 (char*)((FrString*)files->first())->stringValue() ;
-      if (verbose)
-	 cout << ";   processing " << filename << endl ;
-      analyze_context(filename,params,delim,key_words) ;
+      StringBuilder phrase ;
+      for (size_t i = 0 ; i < max ; ++i)
+	 {
+	 if (i > 0) phrase += " " ;
+	 phrase += corpus->getWordForLoc(loc+i) ;
+	 phrase += '\0' ;		// ensure termination when we access the buffer
+	 WcWordCorpus::ID tok ;
+	 if (tokenized_word(*phrase,tok,corpus,params->autoNumbers()))
+	    {
+	    token = tok ;
+	    longest_match = i+1 ;
+	    }
+	 phrase.remove() ;		// drop the terminator before adding the next word
+	 }
       }
-   cout << ";  Analyzing files took " << etimer.read100ths() << "s ("
-	<< timer.readsec() << " CPU seconds)" << endl ;
-   return ;
+   if (longest_match == 0)
+      {
+      if (loc >= corpus->corpusSize())
+	 token = corpus->newlineID() ;
+      else
+	 token = corpus->getContextID(loc) ;
+      longest_match = 1 ;
+      }
+   return longest_match ;
 }
 
 //----------------------------------------------------------------------
 
-static bool create_empty_context_list(const FrSymbol *compound, FrObject *entry, va_list args)
+bool WcContext::makeLeftContext(size_t loc, const WcParameters *params)
 {
-   size_t count = (size_t)entry ;
-   if (count >= min_frequency && count <= max_frequency &&
-       (!exclude_numbers || !is_compound_number(compound)))
+   m_numIDs = 0 ;
+   m_contextlength = 0 ;
+   for (size_t i = 0 ; i < m_leftcontext ; ++i)
       {
-      WcSparseArray *counts = new WcSparseArray ;
-      FrVarArg(FrSymHashTable*,ht) ;
-      ht->add(compound,counts) ;
+      size_t token_length(1) ;
+      // handle hitting the start of the corpus
+      size_t limit = m_corpus->longestContextEquiv() ;
+      if (limit > loc)
+	 limit = loc ;
+      WcWordCorpus::ID token(m_corpus->newlineID()) ;
+      for (size_t j = limit ; j >= 1 ; --j)
+	 {
+	 token_length = find_context_term(m_corpus,loc-j,params,token) ;
+	 if (token_length == j)
+	    break ;
+	 }
+      m_canon_ids[m_contextlength++] = token ;
+      for (size_t j = 1 ; j <= token_length ; ++j)
+	 {
+	 m_ids[m_numIDs++] = m_corpus->getID(loc-j) ;
+	 }
+      loc -= token_length ;
+      if (token == m_corpus->newlineID())
+	 {
+	 // we've hit the beginning of the line, so replicate the
+	 //   newline token for the rest of the context
+	 while (m_contextlength < m_leftcontext)
+	    {
+	    m_canon_ids[m_contextlength++] = token ;
+	    m_ids[m_numIDs++] = token ;
+	    ++i ;
+	    }
+	 }
       }
-   return true ;			// continue iterating
+   // reverse the stored IDs so that they are in the same order as in the WcWordCorpus
+   std::reverse(m_ids,m_ids+m_numIDs) ;
+   m_occurrences = 1 ;
+   return true ;
 }
 
 //----------------------------------------------------------------------
 
-FrList *WcLoadFileList(bool use_stdin, const char *listfile)
+bool WcContext::makeRightContext(size_t loc, const WcParameters* params)
 {
-   FrList *filelist = nullptr ;
-   if (use_stdin)
-      pushlist(new FrString("-"),filelist) ;
+   m_numIDs = 0 ;
+   m_contextlength = 0 ;
+   WcWordCorpus::ID newline = m_corpus->newlineID() ;
+   WcWordCorpus::ID prev_id = WcWordCorpus::ErrorID ;
+   for (size_t i = 0 ; i < params->neighborhoodRight() ; ++i)
+      {
+      // handle the case of falling off the end of a line or the end of the corpus
+      if (prev_id == newline || loc >= m_corpus->corpusSize())
+	 {
+	 m_ids[m_numIDs++] = newline ;
+	 m_canon_ids[m_contextlength++] = newline ;
+	 loc++ ;
+	 }
+      else
+	 {
+	 WcWordCorpus::ID token(newline) ;
+	 size_t token_length(find_context_term(m_corpus,loc,params,token)) ;
+	 m_canon_ids[m_contextlength++] = token ;
+	 prev_id = token ;
+	 for (size_t i = 0 ; i < token_length ; ++i)
+	    {
+	    m_ids[m_numIDs++] = m_corpus->getID(loc+i) ;
+	    }
+	 loc += token_length ;
+	 }
+      }
+   m_occurrences = 1 ;
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+void WcContext::addLeftContext(WcWordCorpus::Index loc, const WcParameters* params,
+			        WcIDCountHashTable& counts)
+{
+   size_t wc = wordCount() ;
+   if (loc >= wc && sameContext(loc-wc))
+      {
+      addOccurrence() ;
+      }
    else
       {
-      FILE *listfp = stdin ;
-      if (listfile && *listfile)
-	 {
-	 listfp = fopen(listfile,"r") ;
-	 if (!listfp)
-	    {
-	    cerr << "Unable to open " << listfile
-		 << " to get list of corpus files!" << endl;
-	    exit(EXIT_FAILURE) ;
-	    }
-	 }
-      while (!feof(listfp))
-	 {
-	 char line[FrMAX_LINE] ;
-	 if (fgets(line,sizeof(line),listfp))
-	    {
-	    char *filename = line ;
-	    FrSkipWhitespace(filename) ;
-	    char *end = strchr(filename,'\0') ;
-	    while (end > filename && Fr_isspace(end[-1]))
-	       end-- ;
-	    *end = '\0' ;
-	    if (*filename && *filename != '#' && *filename != ';')
-	       pushlist(new FrString(filename),filelist) ;
-	    }
-	 }
-      filelist = listreverse(filelist) ;
-      fclose(listfp) ;
-      }
-   return filelist ;
-}
-
-//----------------------------------------------------------------------
-
-static FrList *remove_unprintable(FrList *words)
-{
-   FrSymbol *null = FrSymbolTable::add("") ;
-   FrList *result = nullptr ;
-   FrList **end = &result ;
-   while (words)
-      {
-      FrSymbol *word = (FrSymbol*)poplist(words) ;
-      if (word != null)
-	 result->pushlistend(word,end) ;
-      }
-   *end = nullptr ;			// terminate result list
-   return result ;
-}
-
-//----------------------------------------------------------------------
-
-static void update_cooccur(FrSymbol *word1, FrSymbol *word2, FrSymHashTable *cooccur_table)
-{
-   FrSymCountHashTable *cooccur = static_cast<FrSymCountHashTable*>(cooccur_table->lookup(word1)) ;
-   if (!cooccur)
-      {
-      cooccur = new FrSymCountHashTable ;
-      if (cooccur_table->add(word1,cooccur))
-	 {
-	 // someone else created the sub-table in parallel, so discard
-	 //   the one we tried to add and use the other one
-	 delete cooccur ;
-	 cooccur = static_cast<FrSymCountHashTable*>(cooccur_table->lookup(word1)) ;
-	 }
-      }
-   if (cooccur)
-      {
-      cooccur->addCount(word2,1) ;
+      updateCounts(counts) ;
+      makeLeftContext(loc,params) ;
       }
    return ;
 }
 
 //----------------------------------------------------------------------
 
-static void collect_cooccur(const char *sent, FrSymHashTable *cooccur_table,
-			    bool have_markup, const FrSymHashTable *desired_words)
+void WcContext::addRightContext(WcWordCorpus::Index loc, const WcParameters* params,
+				 WcIDCountHashTable& counts)
 {
-   if (sent && *sent)
+   // try to re-use the computed context from the previous occurrence by only generating
+   //   the context if we have a difference sequence of word IDs this time around
+   if (sameContext(loc))
       {
-      FrList *swords = FrCvtSentence2Wordlist(sent) ;
-      if (exclude_punctuation)
-	 swords = remove_punctuation(swords) ;
-      FrCharEncoding enc = lowercase_source ? char_encoding : FrChEnc_RawOctets ;
-      swords = remove_unprintable(swords) ;
-      FrSymbol *prevword = nullptr ;
-      while (swords)
-	 {
-	 FrObject *srcword = poplist(swords) ;
-	 FrSymbol *word ;
-	 if (have_markup)
-	    {
-	    char *sym = WcStripCoindex(FrPrintableName(srcword),enc) ;
-	    word = FrSymbolTable::add(sym) ;
-	    FrFree(sym) ;
-	    }
-	 else
-	    {
-	    word = FrSymbolTable::add(FrPrintableName(srcword)) ;
-	    }
-	 free_object(srcword) ;
-	 if (desired_words && !desired_words->contains(word))
-	    {
-	    // if the current word is not frequent enough, don't
-	    //   generate co-occurrence counts with it as either the
-	    //   second word (this iteration) or first word (next
-	    //   iteration)
-	    word = nullptr ;
-	    }
-	 if (prevword && word)
-	    {
-	    update_cooccur(prevword,word,cooccur_table) ;
-	    }
-	 prevword = word ;
-	 }
+      addOccurrence() ;
+      }
+   else
+      {
+      updateCounts(counts) ;
+      makeRightContext(loc,params) ;
       }
    return ;
 }
 
+/************************************************************************/
+/************************************************************************/
+
+static WcTermVector* add_vector(CtxtVecInfo* cvec_info, Symbol* keysym, size_t freq,
+   WcIDCountHashTable* counts, const WcWordCorpus* corpus, const WcParameters& params)
+{
+   WcTermVector* tv = WcTermVector::create(counts,corpus,params) ;
+   tv->setKey(keysym) ;
+   tv->setWeight(freq) ;
+   if (params.m_decay_type != Decay_None)
+      {
+      if (tv->isSparseVector())
+	 tv->weightTerms(params.m_decay_type, params.m_past_boundary_weight) ;
+      }
+   if (cvec_info && cvec_info->ht->add(keysym,tv))
+      {
+      // we've already used that keysym, so gensym a new sym
+      keysym = SymbolTable::current()->gensym(keysym->c_str()) ;
+      cvec_info->ht->add(keysym,tv) ;
+      }
+   return tv ;
+}
+
 //----------------------------------------------------------------------
 
-static bool collect_cooccur_counts_batch(const WcLineBatch &lines, const WcParameters *params,
-					 va_list args)
+static bool free_key(Object *key, Object *value)
 {
-   FrVarArg(FrSymHashTable*,cooccur_table) ;
-   FrVarArg(const FrSymHashTable*,desired_words) ;
-   FrVarArg2(bool,int,run_verbosely) ;
-   bool have_markup = params->haveMarkup() ;
-   for (size_t i = 0 ; i < lines.numLines() ; ++i)
-      {
-      collect_cooccur(lines.line(i),cooccur_table,have_markup,desired_words) ;
-      }
-   WcShowProgress(num_examples,lines.numLines(),2000,";   ",run_verbosely) ;
+   key->free() ;
+   value->free() ;
    return true ;
 }
 
 //----------------------------------------------------------------------
 
-static bool by_chance(size_t freq1, size_t freq2, size_t cooccur,
-		      size_t corpus_size)
+static bool free_key(Object *key, size_t /*value*/)
+{
+   key->free() ;
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+static CtxtKey* make_context_key(const CtxtVecInfo* cvec_info, const WcWordCorpus* corpus,
+				 WcWordCorpus::Index match, size_t keylen)
+{
+   WcWordCorpus::Index loc = corpus->getForwardPosition(match) ;
+   CtxtKey* contextkey = new CtxtKey ;
+   for (size_t i = 1 ; i <= cvec_info->params->left_context ; i++)
+      {
+      WcWordCorpus::ID tok = corpus->getContextEquivID(loc-i) ;
+      contextkey->addID(tok) ;
+      }
+   for (size_t i = 0 ; i < cvec_info->params->right_context ; i++)
+      {
+      WcWordCorpus::ID tok = corpus->getContextEquivID(loc+keylen+i) ;
+      contextkey->addID(tok) ;
+      }
+   return contextkey ;
+}
+
+//----------------------------------------------------------------------
+
+static bool add_contextual_vector(Object *key, Object* value, CtxtVecInfo* cvec_info, Symbol* keysym,
+   const WcWordCorpus* corpus, const WcParameters& params)
+{
+   CtxtKey* context_key = (CtxtKey*)key ;
+   tvContextInfo* info = (tvContextInfo*)value ;
+   WcIDCountHashTable* dcounts = &info->counts ;
+   auto tv = add_vector(cvec_info,keysym,info->freq,dcounts,corpus,params) ;
+   if (tv)
+      {
+      context_key->rewind() ;
+      // set left and right disambiguation contexts on the vector
+      ListBuilder disambig ;
+      for (size_t i = 0 ; i < cvec_info->params->left_context ; ++i)
+	 {
+	 WcWordCorpus::ID id = context_key->nextID() ;
+	 disambig.push(String::create(corpus->getWord(id))) ;
+	 }
+      tv->leftConstraint(disambig.move()) ;
+      for (size_t i = 0 ; i < cvec_info->params->right_context ; ++i)
+	 {
+	 WcWordCorpus::ID id = context_key->nextID() ;
+	 disambig.push(String::create(corpus->getWord(id))) ;
+	 }
+      tv->rightConstraint(disambig.move()) ;
+      // if the term is a seed, add the associated label to the vector
+      const auto seeds = params.equivalenceClasses() ;
+      Object* label ;
+      if (seeds && seeds->lookup(keysym,&label))
+	 {
+	 tv->setLabel(static_cast<Symbol*>(label)) ;
+	 }
+      }
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+static bool desireable_term(const WcWordCorpus::ID* key, unsigned keylen, const WcWordCorpus* corpus,
+   WcWordIDPairTable* mutualinfo)
+{
+   if (keylen > 1)
+      {
+      // skip the phrase if it starts or ends with a newline or stopword
+      if (!corpus->getWord(key[keylen-1]))
+	 {
+	 return false ;
+	 }
+      // skip the phrase if it is not coherent enough
+      // we decide coherence based on mutual info between adjacent pairs of words;
+      //   if any pair is below threshold (and thus does not appear in the mutualinfo
+      //   table), we declare it not coherent and skip it
+      for (unsigned i = 1 ; i < keylen ; ++i)
+	 {
+	 if (!mutualinfo->contains(key[i-1],key[i]))
+	    {
+	    return false ;
+	    }
+	 }
+      }
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+static bool make_context_vector(const WcWordCorpus::ID* key, unsigned keylen, size_t freq,
+   WcWordCorpus::Index first_match, CtxtVecInfo* cvec_info)
+{
+   const WcWordCorpus* corpus = cvec_info->corpus ;
+   const WcParameters* params = cvec_info->params ;
+   WcWordCorpus::Index last_match = first_match + freq ;
+   size_t disambig = params->left_context + params->right_context ;
+   // we need a hash table of contexts, keyed by the words which will become part of the
+   //    disambiguation context for substitution when normalizing text
+   ScopedObject<ObjHashTable> by_context(10000) ;
+   if (disambig)
+      {
+      // collect context terms which are above the frequency cutoff
+      ScopedObject<ObjCountHashTable> context_counts(10000) ;
+      context_counts->onRemove(free_key) ;
+      for (auto match = first_match ; match < last_match ; ++match)
+	 {
+	 CtxtKey* contextkey = make_context_key(cvec_info,corpus,match,keylen) ;
+	 if (context_counts->addCount(contextkey,1) > 1)
+	    {
+	    // the key was already in the hash table, so we don't need it to live until the
+	    //   hash table is destroyed
+	    contextkey->free() ;
+	    }
+	 }
+      size_t minfreq = params->minWordFreq() ;
+      for (const auto entry : *context_counts)
+	 {
+	 size_t count = entry.second ;
+	 if (count >= minfreq)
+	    {
+	    tvContextInfo *dcontexts = new tvContextInfo(corpus,params->neighborhoodLeft(),params->left_context,
+							 params->right_context) ;
+	    dcontexts->freq = count ;
+	    by_context->add(entry.first->clone().move(),dcontexts) ;
+	    }
+	 }
+      }
+   ScopedObject<WcIDCountHashTable> counts(10000) ;
+   unsigned lcontext = cvec_info->params->neighborhoodLeft() ;
+   WcContext left_context(corpus,-1,lcontext) ;
+   WcContext right_context(corpus,+1,lcontext) ;
+   size_t processed = 0 ;
+   size_t remaining = freq ;
+   constexpr size_t interval = 50000 ;
+   for (auto match = first_match ; match < last_match ; ++match)
+      {
+      // keep the progress indicator moving when we get down to a couple of threads working on very
+      //   high-frequency terms
+      if ((++processed % interval) == 0)
+	 {
+	 (*progress) += interval ;
+	 remaining -= interval ;
+	 }
+      WcWordCorpus::Index loc = corpus->getForwardPosition(match) ;
+      left_context.addLeftContext(loc,cvec_info->params,*counts) ;
+      right_context.addRightContext(loc+keylen,cvec_info->params,*counts) ;
+      if (disambig)
+	 {
+	 Ptr<CtxtKey> contextkey(make_context_key(cvec_info,corpus,match,keylen)) ;
+	 tvContextInfo *dcontexts = (tvContextInfo*)by_context->lookup(contextkey) ;
+	 if (dcontexts)
+	    {
+	    WcContext* left_disambig = &dcontexts->left ;
+	    WcContext* right_disambig = &dcontexts->right ;
+	    WcIDCountHashTable* dcounts = &dcontexts->counts ;
+	    left_disambig->addLeftContext(loc-cvec_info->params->left_context,cvec_info->params,*dcounts) ;
+	    right_disambig->addRightContext(loc+keylen+cvec_info->params->right_context,cvec_info->params,*dcounts) ;
+	    }
+	 }
+      }
+   left_context.updateCounts(*counts) ;
+   right_context.updateCounts(*counts) ;
+   // convert the accumulated counts into a term vector, and add it to the hash table
+   //   of all term vectors using the word/phrase as the key
+   StringBuilder term ;
+   term += corpus->getNormalizedWord(key[0]) ;
+   for (unsigned i = 1 ; i < keylen ; ++i)
+      {
+      term += " " ;
+      term += corpus->getNormalizedWord(key[i]) ;
+      }
+   term += '\0' ;			// ensure termination of string when we access the buffer below
+   Symbol *keysym = SymbolTable::current()->add(*term) ;
+   add_vector(cvec_info,keysym,freq,&counts,corpus,*params) ;
+   // iterate over the different disambiguation contexts, adding those whose frequency is above
+   //   the clustering threshold to the list of vectors to be clustered
+   by_context->onRemove(free_key) ;
+   for (const auto entry : *by_context)
+      {
+      auto context_key = static_cast<CtxtKey*>(entry.first) ;
+      add_contextual_vector(context_key,entry.second,cvec_info,keysym,corpus,*params) ;
+      }
+   (*progress) += remaining ;
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+static bool conditional_make_context_vector(const Symbol* key, const WcWordCorpus* corpus, CtxtVecInfo* cvec_info)
+{
+   SymHashTable* ht = cvec_info->ht ;
+   if (ht->contains(key))
+      return true ;			// continue iterating
+   // split the key into words and convert them into word IDs
+   Ptr<List> words(List::createWordList(key->c_str())) ;
+   size_t keylen = words->size() ;
+   LocalAlloc<WcWordCorpus::ID> keyids(keylen+1) ;
+   size_t i = 0 ;
+   for (auto w : *words)
+      {
+      const char *word = w->printableName() ;
+      if ((keyids[i++] = corpus->findID(word)) == WcWordCorpus::ErrorID)
+	 {
+	 // this word is unknown, so bail out
+	 return true ;			// continue iterating
+	 }
+      }
+   // we get here if all of the words actually exist in the corpus, so find the
+   //   occurrences of the phrase
+   WcWordCorpus::Index first_match, last_match ;
+   if (corpus->lookup(keyids,keylen,first_match,last_match))
+      {
+      // we found the phrase, so now collect the contexts of its occurrences
+      size_t freq = last_match - first_match + 1 ;
+      make_context_vector(keyids,keylen,freq,first_match,cvec_info) ;
+      }
+   return true ; // continue iterating
+}
+
+//----------------------------------------------------------------------
+
+static void analyze_contexts(const WcWordCorpus* corpus, const WcParameters* params,
+			     SymHashTable* ht)
+{
+   Timer timer ;
+   unsigned maxphrase = params->phraseLength() ;
+   unsigned minphrase = params->allLengths() ? 1 : maxphrase ;
+   CtxtVecInfo cvec_info ;
+   cvec_info.params = params ;
+   cvec_info.corpus = corpus ;
+   cvec_info.ht = ht ;
+   progress = new ConsoleProgressIndicator(1,corpus->corpusSize()*maxphrase,50,";   ",";   ") ;
+   progress->showElapsedTime(true) ;
+   size_t minfreq = params->minWordFreq() ;
+   auto mi = params->mutualInfoID() ;
+   auto enum_fn = [&] (const WcWordCorpus::SufArr*,const WcWordCorpus::ID* key,unsigned keylen, size_t freq,
+		       WcWordCorpus::Index first)
+		     { return make_context_vector(key,keylen,freq,first,&cvec_info) ; } ;
+   auto filter = [=] (const WcWordCorpus::SufArr*, const WcWordCorpus::ID* key, unsigned keylen,
+      		      size_t freq, bool all)
+		    {
+		    bool keep = (freq >= minfreq
+		       && corpus->hasAttribute(key[0],WcATTR_DESIRED) && corpus->getWord(key[0])
+		       && (all || keylen == 1 || corpus->hasAttribute(key[keylen-1],WcATTR_DESIRED))
+		       && (all || desireable_term(key,keylen,corpus,mi))) ;
+		    if (!keep) (*progress) += freq ;
+		    return keep ;
+		    } ;
+   if (minphrase == 1)
+      {
+      // handle single words
+      const_cast<WcWordCorpus*>(corpus)->enumerateForwardParallel(1,1,enum_fn,filter,true) ;
+      ++minphrase ;
+      }
+   // handle multi-word phrases
+   if (maxphrase >= minphrase)
+      const_cast<WcWordCorpus*>(corpus)->enumerateForwardParallel(minphrase,maxphrase,enum_fn,filter,true) ;
+   corpus->finishForwardParallel() ;
+   auto seeds = params->equivalenceClasses() ;
+   // iterate through 'seeds' looking for any terms which didn't get added to 'ht'
+   if (seeds)
+      {
+      progress = new NullProgressIndicator ;
+      cout << ";   checking for missing seeds\n" ;
+      ConsoleProgressIndicator prog(1,seeds->size(),50,";   ",";   ") ;
+      prog.showElapsedTime(true) ;
+      for (auto entry : *seeds)
+	 {
+	 auto keysym = static_cast<const Symbol*>(entry.first) ;
+	 conditional_make_context_vector(keysym,corpus,&cvec_info) ;
+	 ++prog ;
+	 }
+      }
+   progress = nullptr ;
+   cout << ";   processing contexts took " << timer << ".\n" ;
+   return ;
+}
+
+/************************************************************************/
+/************************************************************************/
+
+List *WcLoadFileList(bool use_stdin, const char *listfile)
+{
+   ListBuilder filelist ;
+   if (use_stdin)
+      filelist += String::create("-") ;
+   else
+      {
+      if (!listfile || !*listfile) listfile = "-" ;
+      CInputFile listfp(listfile) ;
+      if (!listfp)
+	 {
+	 cerr << "Unable to open " << listfile
+	      << " to get list of corpus files!\n" ;
+	 exit(EXIT_FAILURE) ;
+	 }
+      while (CharPtr filename { listfp.getTrimmedLine() })
+	 {
+	 if (**filename && **filename != '#' && **filename != ';')
+	    filelist += String::create(filename) ;
+	 }
+      }
+   return filelist.move() ;
+}
+
+//----------------------------------------------------------------------
+
+bool by_chance(size_t freq1, size_t freq2, size_t cooccur,
+	       size_t corpus_size)
 {
    if (corpus_size >= 100 && freq1 > cooccur && freq2 > cooccur)
       {
@@ -423,12 +806,14 @@ static bool by_chance(size_t freq1, size_t freq2, size_t cooccur,
 
 //----------------------------------------------------------------------
 
-static double score_mi_chisquared(const FrSymbol * /*word1*/, size_t freq1,
-				  const FrSymbol * /*word2*/, size_t freq2,
-				  size_t cooccur, size_t total, void *)
+double score_mi_chisquared(const WcWordCorpus* corpus,
+			   WcWordCorpus::ID word1, WcWordCorpus::ID word2,
+			   size_t cooccur, void *)
 {
-   if (cooccur < min_frequency)
-      return -1.0 ;			// don't use this pair
+   // the enumeration ensures that the cooccurrence count is always above threshold
+   //if (cooccur < min_frequency)
+   //   return -1.0 ;			// don't use this pair
+
    //  N=total, |X|=freq1, |Y|=freq2, C[X,Y]=cooccur
    //
    //         N( (N-C[X,Y])C[X,Y] - |X||Y| )^2
@@ -437,6 +822,9 @@ static double score_mi_chisquared(const FrSymbol * /*word1*/, size_t freq1,
    //
    // we normalize the above into the range 0..1 by omitting the N in the
    //   numerator
+   size_t freq1 = corpus->getFreq(word1) ;
+   size_t freq2 = corpus->getFreq(word2) ;
+   size_t total = corpus->corpusSize() ;
    double chi = ((double)(total-cooccur)*(double)cooccur -
 		 (double)freq1*(double)freq2) ;
    double denom = (double)freq1 * (double)(total-freq1) *
@@ -448,508 +836,453 @@ static double score_mi_chisquared(const FrSymbol * /*word1*/, size_t freq1,
 
 //----------------------------------------------------------------------
 
-static double score_mi_correlation(const FrSymbol * /*word1*/, size_t freq1,
-				   const FrSymbol * /*word2*/, size_t freq2,
-				   size_t cooccur, size_t /*total*/, void *)
+double score_mi_correlation(const WcWordCorpus* corpus,
+			    WcWordCorpus::ID word1, WcWordCorpus::ID word2,
+			    size_t cooccur, void *)
 {
-   if (cooccur < min_frequency)
-      return -1.0 ;			// don't use this pair
+   // the enumeration ensures that the cooccurrence count is always above threshold
+   //if (cooccur < min_frequency)
+   //   return -1.0 ;			// don't use this pair
+   size_t freq1 = corpus->getFreq(word1) ;
+   size_t freq2 = corpus->getFreq(word2) ;
    size_t freq = (freq1 < freq2) ? freq1 : freq2 ;
    return cooccur / (double)freq ;
 }
 
 //----------------------------------------------------------------------
 
-static bool filter_mi_pair(const FrSymbol *word2, size_t cooccur_count, va_list args)
+static WcWordIDPairTable* report_MI_pairings(WcWordIDPairTable* mutualinfo, Timer& timer)
 {
-   FrVarArg(const FrSymbol*,word1) ;
-   FrVarArg(size_t,freq1) ;
-   FrVarArg(size_t,corpus_size) ;
-   FrVarArg(const FrSymCountHashTable*,uniwordfreq) ;
-   FrVarArg(const WcParameters*,params) ;
-   WcWordPairTable *mutualinfo = params->mutualInfo() ;
-   double thresh = params->miThreshold() ;
-   WcMIScoreFunc *fn = params->miScoreFunc() ;
-   void *udata = params->miScoreData() ;
-   size_t freq2 = uniwordfreq->lookup(word2) ;
-   if (fn && fn(word1,freq1,word2,freq2,cooccur_count,corpus_size,udata) >= thresh &&
-       !by_chance(freq1,freq2,cooccur_count,corpus_size))
-      {
-      mutualinfo->addPair(word1,word2) ;
-      }
-   return true ;
-}
-
-//----------------------------------------------------------------------
-
-static bool filter_mi_pairs(const FrSymbol *word1, FrObject *cooccurrences,
-			    va_list args)
-{
-   FrVarArg(const WcParameters*,params) ;
-   FrVarArg(const FrSymCountHashTable*,uniwordfreq) ;
-   FrVarArg(size_t,corpus_size) ;
-   FrSymCountHashTable *subtable = static_cast<FrSymCountHashTable*>(cooccurrences) ;
-   if (subtable)
-      {
-      size_t freq1 = uniwordfreq->lookup(word1) ;
-      subtable->iterate(filter_mi_pair,word1,freq1,corpus_size,uniwordfreq,params) ;
-      }
-   return true ;
-}
-
-//----------------------------------------------------------------------
-
-static bool free_subtable(const FrSymbol */*key*/, FrObject *val)
-{
-   free_object(val) ;
-   return true ;
-}
-
-//----------------------------------------------------------------------
-
-WcWordPairTable *WcComputeMutualInfo(const FrList *filelist,
-				     const WcParameters *params,
-				     const FrSymCountHashTable *uniwordfreq,
-				     size_t corpus_size)
-{
-   FrElapsedTimer etimer ;
-   FrTimer timer ;
-   const FrSymHashTable *desired_words = params->desiredWords() ;
-   FrSymHashTable *cooccur_table = new FrSymHashTable ;
-   for (const FrList *files = filelist ; files ; files = files->rest())
-      {
-      const char *filename =
-	 (char*)((FrString*)files->first())->stringValue() ;
-      FILE *fp = WcOpenCorpus(filename) ;
-      if (fp)
-	 {
-	 if (verbose)
-	    {
-	    cout << ";   processing " << filename << endl
-		 << ";   " << flush ;
-	    }
-	 WcProcessFile(fp,params,&collect_cooccur_counts_batch,cooccur_table,desired_words,verbose) ;
-	 WcCloseCorpus(fp) ;
-	 if (verbose) cout << endl ; // terminate line of progress dots
-	 }
-      else
-	 {
-	 cout << ";!!   Error opening file '" << filename << "'" << endl  ;
-	 }
-      }
-   WcWordPairTable *mutualinfo = new WcWordPairTable ;
-   WcParameters local_params(params) ;
-   local_params.mutualInfo(mutualinfo) ;
-   if (!local_params.miScoreFunc())
-      {
-      local_params.miScoreFunc(params->chiSquaredMI()?score_mi_chisquared:score_mi_correlation,0) ;
-      }
-   cooccur_table->iterateAndClear(filter_mi_pairs,&local_params,uniwordfreq,corpus_size) ;
-   local_params.mutualInfo(0) ;
-   cooccur_table->onRemove(free_subtable) ;
-   delete cooccur_table ;
    if (mutualinfo && mutualinfo->currentSize() > 0)
       {
       cout << ";  found " << mutualinfo->currentSize()
-	   << " words with MI pairings in " << etimer.read100ths() << "s ("
-	   << timer.readsec() << " CPU seconds)" << endl ;
+	   << " words with MI pairings in " ;
       }
    else
-      cout << ";  no mutual-information pairings found!" << endl ;
+      {
+      mutualinfo->free() ;
+      mutualinfo = nullptr ;
+      cout << ";  no mutual-information pairings found!  Spent " ;
+      }
+   cout << timer << endl ;
    return mutualinfo ;
 }
 
 //----------------------------------------------------------------------
 
-inline bool is_stopword(const FrSymbol *word)
+static bool mi_for_wordpair(const SuffixArray<WcWordCorpus::ID,WcWordCorpus::Index>*,
+   const WcWordCorpus::ID* key, unsigned /*keylen*/, size_t cooccur_count, WcWordCorpus::Index,
+   const WcParameters* params)
 {
-   return (word && word->inverseRelation() != nullptr) ;
-}
-
-//----------------------------------------------------------------------
-
-static bool filter_by_freq(const FrSymbol *name, size_t freq, va_list args)
-{
-   FrVarArg(FrSymHashTable *,desired_words) ;
-   FrVarArg(const FrObjHashTable *,seeds) ;
-   if (freq >= min_frequency && !is_stopword(name))
+   WcWordCorpus* corpus = params->corpus() ;
+   if (params->noPeriodMutualInfo())
       {
-      desired_words->add(name) ;
+      WcWordCorpus::ID period = corpus->findID(".") ;
+      if (key[0] == period || key[1] == period)
+	 return true ;
       }
-   else if (seeds && freq >= min_frequency) //FIXME?
+   WcMIScoreFuncID *fn = params->miScoreFuncID() ;
+   void *udata = params->miScoreData() ;
+   double thresh = params->miThreshold() ;
+   if (fn && fn(corpus,key[0],key[1],cooccur_count,udata) >= thresh)
       {
-      FrString namestr(name->symbolName()) ;
-      if (seeds->contains(&namestr))
+      size_t freq1 = corpus->getFreq(key[0]) ;
+      size_t freq2 = corpus->getFreq(key[1]) ;
+      size_t corpus_size = corpus->corpusSize() ;
+      if (!by_chance(freq1,freq2,cooccur_count,corpus_size))
 	 {
-	 desired_words->add(name) ;
+	 WcWordIDPairTable *mutualinfo = params->mutualInfoID() ;
+	 mutualinfo->addPair(key[0],key[1]) ;
 	 }
       }
+   ++(*progress) ;
    return true ;
 }
 
 //----------------------------------------------------------------------
 
-static void count_frequencies(const char *sent, FrSymCountHashTable *freq, bool have_markup,
-			      size_t *corpus_size)
+WcWordIDPairTable *WcComputeMutualInfo(const WcWordCorpus* corpus,
+				       const WcParameters* params)
 {
-   if (sent && *sent)
+   Timer timer ;
+   WcWordIDPairTable *mutualinfo = WcWordIDPairTable::create() ;
+   WcParameters local_params(params) ;
+   local_params.mutualInfoID(mutualinfo) ;
+   local_params.corpus(const_cast<WcWordCorpus*>(corpus)) ;
+   if (!local_params.miScoreFuncID())
       {
-      FrList *swords = FrCvtSentence2Wordlist(sent) ;
-      if (exclude_punctuation)
-	 swords = remove_punctuation(swords) ;
-      FrCharEncoding enc = lowercase_source ? char_encoding : FrChEnc_RawOctets ;
-      while (swords)
-	 {
-	 FrObject *srcword = poplist(swords) ;
-	 FrSymbol *word ;
-	 if (have_markup)
-	    {
-	    char *sym = WcStripCoindex(FrPrintableName(srcword),enc) ;
-	    word = FrSymbolTable::add(sym) ;
-	    FrFree(sym) ;
-	    }
-	 else
-	    {
-	    word = FrSymbolTable::add(FrPrintableName(srcword)) ;
-	    }
-	 freq->addCount(word,1) ;
-	 (*corpus_size)++ ;
-	 free_object(srcword) ;
-	 }
+      local_params.miScoreFuncID(params->chiSquaredMI()?score_mi_chisquared:score_mi_correlation,nullptr) ;
       }
-   return ;
+   progress = new ConsoleProgressIndicator(DOT_INTERVAL,0,50,";   ",";   ") ;
+   size_t minfreq = params->minWordFreq() ;
+   auto vs = corpus->vocabSize() ;
+   ((WcWordCorpus*)corpus)->enumerateForwardParallel(2,2,
+      [&] (const WcWordCorpus::SufArr* sa,const WcWordCorpus::ID* key,unsigned keylen, size_t freq, WcWordCorpus::Index first)
+      { return mi_for_wordpair(sa,key,keylen,freq,first,&local_params) ; },
+      [=] (const WcWordCorpus::SufArr* /*sa*/,const WcWordCorpus::ID* key,unsigned keylen, size_t freq, bool /*all*/)
+	 { return freq >= minfreq && key[0] < vs && key[keylen-1] < vs ; } ) ;
+   progress = nullptr ;
+   local_params.mutualInfoID(nullptr) ;
+   return report_MI_pairings(mutualinfo,timer) ;
 }
 
 //----------------------------------------------------------------------
 
-static bool count_frequencies_batch(const WcLineBatch &lines, const WcParameters *params,
-				    va_list args)
+static bool tag_desired_words(const WcWordCorpus* corpus, const WcParameters* params)
 {
-   FrVarArg(FrSymCountHashTable *,freq) ;
-   FrVarArg(size_t*,corpus_size) ;
-   FrVarArg2(bool,int,run_verbosely) ;
-   bool have_markup = params->haveMarkup() ;
-   for (size_t i = 0 ; i < lines.numLines() ; ++i)
+   Timer timer ;
+   const auto seeds = params->equivalenceClasses() ;
+   size_t count(0) ;
+   SymbolTable* symtab = SymbolTable::current() ;
+   if (params->excludeNumbers() && corpus->numberToken() != corpus->ErrorID)
+      corpus->setAttribute(corpus->numberToken(),WcATTR_STOPWORD) ;
+   for (WcWordCorpus::ID i = 0 ; i < corpus->vocabSize() ; ++i)
       {
-      count_frequencies(lines.line(i),freq,have_markup,corpus_size) ;
+      WcWordCorpus::Index freq = corpus->getFreq(i) ;
+      if (freq < params->minWordFreq() || i == corpus->newlineID())
+	 continue ;
+      const char *name = corpus->getWord(i) ;
+      if (!corpus->hasAttribute(i,WcATTR_STOPWORD) &&
+	  !(params->excludeNumbers() && is_number(name)))
+	 {
+	 corpus->setAttribute(i,WcATTR_DESIRED) ;
+	 ++count ;
+	 }
+      else if (seeds)
+	 {
+	 Symbol* namesym = symtab->add(name) ;
+	 if (seeds->contains(namesym))
+	    {
+	    corpus->setAttribute(i,WcATTR_DESIRED) ;
+	    ++count ;
+	    }
+	 }
       }
-   WcShowProgress(num_examples,lines.numLines(),2000,";   ",run_verbosely) ;
+   cout << ";   found " << count << " words above threshold.\n" ;
+   cout << ";   tagging desired words took " << timer << ".\n" ;
    return true ;
 }
 
 //----------------------------------------------------------------------
 
-static FrSymCountHashTable *count_frequencies(const FrList *filelist,
-					      const WcParameters *params,
-					      size_t &corpus_size,
-					      FrSymHashTable *&desired_words)
-{
-   FrSymCountHashTable *uniwordfreq = new FrSymCountHashTable ;
-   FrElapsedTimer etimer ;
-   FrTimer timer ;
-   desired_words = nullptr ;
-   const FrObjHashTable *seeds = params->equivalenceClasses() ;
-   for ( ; filelist ; filelist = filelist->rest())
-      {
-      const char *filename = (char*)((FrString*)filelist->first())->stringValue() ;
-      FILE *fp = WcOpenCorpus(filename) ;
-      if (fp)
-	 {
-	 if (verbose)
-	    {
-	    cout << ";   processing " << filename << endl
-		 << ";   " << flush ;
-	    }
-	 WcProcessFile(fp,params,&count_frequencies_batch,uniwordfreq,&corpus_size,verbose) ;
-	 WcCloseCorpus(fp) ;
-	 if (verbose) cout << endl ; // terminate line of progress dots
-	 }
-      else
-	 {
-	 cout << ";!!   Error opening file '" << filename << "'" << endl ;
-	 }
-      }
-   FrSymHashTable *desired = new FrSymHashTable ;
-   if (desired)
-      {
-      desired_words = desired ;
-      uniwordfreq->iterate(filter_by_freq,desired,seeds) ;
-      cout << ";   found " << desired->currentSize() << " words above threshold" << endl ;
-      }
-   cout << ";   counting words took " << etimer.read100ths() << "s ("
-	<< timer.readsec() << " CPU seconds)." << endl ;
-   return uniwordfreq ;
-}
-
-//----------------------------------------------------------------------
-
-static bool remove_filtered(const FrSymbol *term, FrObject *entry, va_list args)
-{
-   FrVarArg(const FrSymCountHashTable*,word_counts) ;
-   FrVarArg(const WcParameters*,params) ;
-   WcVectorFilterFunc *fn = params->preFilterFunc() ;
-   WcTermVector *tv = (WcTermVector*)entry ;
-   void *data = params->preFilterData() ;
-   if (!fn(tv,word_counts,data))
-      {
-      delete tv ;
-      FrVarArg(FrSymHashTable*,ht) ;
-      ht->remove(term) ;
-      }
-   return true ;
-}
-
-//----------------------------------------------------------------------
-
-static void WcPreFilterVectors(FrSymHashTable *key_words, const FrSymCountHashTable *word_counts,
-			       const WcParameters &params)
+static void WcPreFilterVectors(SymHashTable *key_words, const WcParameters &params)
 {
    if (!key_words)
       return ;
+   Timer timer ;
    size_t before_count = key_words->currentSize() ;
-   key_words->iterate(remove_filtered,word_counts,&params,key_words) ;
+   WcVectorFilterFunc *fn = params.preFilterFunc() ;
+   void *data = params.preFilterData() ;
+   for (const auto entry : *key_words)
+      {
+      auto tv = static_cast<WcTermVector*>(entry.second) ;
+      if (!fn(tv,&params,nullptr,data))
+	 {
+	 key_words->remove(entry.first) ;
+//!!!	 tv->free() ;  //FIXME: crashes with, leaks memory without
+	 }
+      }
    size_t after_count = key_words->currentSize() ;
    if (after_count < before_count)
       {
       size_t disc = before_count - after_count ;
-      cout << ";   discarded " << disc << " vectors." << endl ;
+      cout << ";   discarded " << disc << " of " << before_count << " vectors.\n" ;
+      }
+   if (params.runVerbosely())
+      {
+      cout <<";   filtering vectors took " << timer << ".\n" ;
       }
    return ;
 }
 
 //----------------------------------------------------------------------
 
-static void WcPostFilterClusters(FrList *clusters, const FrSymCountHashTable *word_counts,
-				 const WcParameters &params)
+static int compare(const List* o1, const List* o2)
+{
+   if (o1 == o2) return 0 ;
+   if (!o1 || o1 == List::emptyList()) return -1 ; // anything is greater than NIL
+   return o1->compare(o2) ;
+}
+
+//----------------------------------------------------------------------
+
+static int compare(const Symbol* s1, const Symbol* s2)
+{
+   if (s1 == s2) return 0 ;
+   if (!s1) return -1 ; // anything is greater than NIL
+   if (!s2) return +1 ;
+   return strcmp(s1->c_str(),s2->c_str()) ;
+}
+
+//----------------------------------------------------------------------
+
+static int compare_key_and_context(const Object* o1, const Object* o2)
+{
+   auto tv1 = (WcTermVector*)(o1) ;
+   auto tv2 = (WcTermVector*)(o2) ;
+   if (!tv1 || !tv2)
+      {
+      static bool warned = false ;
+      if (!warned)
+	 cout << "null pointer in array being sorted!\n" ;
+      warned = true ;
+      return tv2 ? -1 : (tv1 ? +1 : 0) ;
+      }
+   int cmp = compare(tv1->key(),tv2->key()) ;
+   if (cmp) return cmp ;
+   cmp = compare(tv1->leftConstraint(),tv2->leftConstraint()) ;
+   if (cmp) return cmp ;
+   cmp = compare(tv1->rightConstraint(),tv2->rightConstraint()) ;
+   if (cmp) return cmp ;
+   return compare(tv1->label(),tv2->label()) ;
+}
+
+//----------------------------------------------------------------------
+
+static int key_and_context_lessthan(const Object* o1, const Object* o2)
+{
+   return compare_key_and_context(o1,o2) < 0 ; 
+}
+
+//----------------------------------------------------------------------
+
+static void WcPostFilterVectors(ClusterInfo* clusters, const WcParameters& params)
+{
+   // generate a list of all the term vectors that have been clustered, sorted by key
+   auto tv_list = clusters->allMembers() ;
+   std::sort(tv_list->begin(),tv_list->end(),key_and_context_lessthan) ;
+   // pass the list to the user callback; it can remove vectors from a cluster by
+   //   setting the term vector's cluster() to nullptr
+   (void)params.globalPostFilterFunc()(tv_list,&params,params.globalPostFilterData()) ;
+   return ;
+}
+
+//----------------------------------------------------------------------
+
+static void WcPostFilterClusters(ClusterInfo* clusters, const WcParameters& params)
 {
    if (!clusters)
       return ;
-   size_t discarded(0) ;
-   WcVectorFilterFunc *fn = params.postFilterFunc() ;
+   Timer timer ;
+   size_t discarded { 0 } ;
+   WcVectorFilterFunc* fn { params.postFilterFunc() } ;
+   Ptr<SymHashTable> keys ;
    void *data = params.postFilterData() ;
-   for ( ; clusters ; clusters = clusters->rest())
+   if (fn && params.postFilterNeedsKeyTable())
       {
-      FrList *clust = (FrList*)clusters->first() ;
-      // cluster format: (NAME tv1 tv2 ....)
-      FrList *prev = clust ;
-      FrList *next ;
-      for (FrList *cl = clust->rest() ; cl ; prev = cl, cl = next)
+      auto members = clusters->allMembers() ;
+      keys = SymHashTable::create(2*members->size()) ;
+      for (const auto mem : *members)
 	 {
-	 next = cl->rest() ;
-	 WcTermVector *tv = (WcTermVector*)cl->first() ;
-	 if (!fn(tv,word_counts,data))
+	 auto tv = reinterpret_cast<WcTermVector*>(mem) ;
+	 keys->add(tv->key(),tv) ;
+	 }
+      }
+   if (clusters && clusters->subclusters())
+      {
+      for (auto cluster : *clusters->subclusters())
+	 {
+	 auto clust = reinterpret_cast<ClusterInfo*>(cluster) ;
+	 Array* members = const_cast<Array*>(clust->members()) ;
+	 bool changed { false } ;
+	 for (auto member = members->begin() ; member != members->end() ; ++member)
 	    {
-	    // chop the term vector out of the cluster by pointing its
-	    //   predecessor at its successor
-	    prev->replacd(next) ;
-	    // and then delete it
-	    cl->replacd(0) ;
-	    cl->replaca(0) ;		// but not the term vector!
-	    free_object(cl) ;
-	    ++discarded ;
+	    auto tv = static_cast<WcTermVector*>(*member) ;
+	    if (!tv->label()
+	       || (!params.keepSingletons() && clust->size() == 1)
+	       || (fn && !fn(tv,&params,keys,data)))
+	       {
+	       // chop the term vector out of the cluster
+	       *member = nullptr ;
+	       ++discarded ;
+	       changed = true ;
+	       }
 	    }
+	 if (changed)
+	    clust->shrink_to_fit() ;
 	 }
       }
    if (discarded > 0)
       {
-      cout << ";   discarded " << discarded << " vectors." << endl ;
+      cout << ";   discarded " << discarded << " vectors.\n" ;
+      }
+   if (params.runVerbosely())
+      {
+      cout << ";   filtering vectors took " << timer << ".\n" ;
       }
    return ;
 }
 
 //----------------------------------------------------------------------
 
-static FrList *WcFilterClusterMembers(FrList *clusters, const FrSymCountHashTable *word_counts,
-				      const WcParameters &params)
+static ClusterInfo* WcFilterClusterMembers(ClusterInfo *clusters, const WcParameters &params)
 {
    if (!clusters)
       return clusters ;
+   Timer timer ;
+   auto result = clusters ;
    WcClusterFilterFunc *fn = params.clusterFilterFunc() ;
-   FrList *result = clusters ;
-   if (fn)
+   if (fn && clusters && clusters->subclusters())
       {
-      size_t discarded(0) ;
-      void *data = params.clusterFilterData() ;
-      FrList *prev = nullptr ;
-      for ( ; clusters ; clusters = clusters->rest())
+      size_t discarded { 0 } ;
+      void *data { params.clusterFilterData() } ;
+      for (auto cl : *clusters->subclusters())
 	 {
-	 FrList *clust = (FrList*)clusters->first() ;
-	 size_t startsize(clust ? listlength(clust->rest()) : 0) ;
-	 FrList *updated = fn(clust,word_counts,data) ;
-	 if (updated != clust)
-	    {
-	    size_t endsize(updated ? listlength(updated->rest()) : 0) ;
-	    if (endsize < startsize)
-	       {
-	       discarded += (startsize - endsize) ;
-	       }
-	    if (updated)
-	       {
-	       clusters->replaca(updated) ;
-	       }
-	    else if (prev)
-	       {
-	       prev->replacd(clusters->rest()) ;
-	       }
-	    else
-	       {
-	       result = clusters->rest() ;
-	       }
-	    }
+	 auto clust = const_cast<ClusterInfo*>(static_cast<const ClusterInfo*>(cl)) ;
+	 if (!clust)
+	    continue ;
+	 size_t startsize { clust->numMembers() } ;
+	 fn(clust,&params,data) ;
+	 discarded += (startsize - clust->numMembers()) ;
 	 }
       if (discarded > 0)
 	 {
-	 cout << ";   discarded " << discarded << " vectors." << endl ;
+	 cout << ";   discarded " << discarded << " vectors.\n" ;
 	 }
       }
-   if (params.clusterPostprocFunc())
+   if (params.clusterPostprocFunc() && result)
       {
-      size_t clusters_before = listlength(result) ;
+      size_t clusters_before = result->size() ;
       result = params.clusterPostprocFunc()(result,params.clusterPostprocData()) ;
-      size_t clusters_after = listlength(result) ;
+      size_t clusters_after = result->size() ;
       if (clusters_before > clusters_after)
 	 {
-	 cout << ";   eliminated/merged " << (clusters_before-clusters_after) << " clusters." << endl ;
+	 cout << ";   eliminated/merged " << (clusters_before-clusters_after) << " of "
+	      << clusters_before << " clusters.\n" ;
 	 }
+      }
+   if (params.runVerbosely())
+      {
+      cout << ";   filtering clusters took " << timer << ".\n" ;
       }
    return result ;
 }
 
 //----------------------------------------------------------------------
 
-void WcProcessCorpusFiles(const char *listfile, bool use_stdin,
-			  FILE *outfp, FILE *tokfp, FILE *tagfp,
-			  const WcParameters *global_params,
-			  FrThresholdList *thresholds,
-			  const char *outfilename, const char *tokfilename,
-			  const char *tagfilename)
+static void process_vectors(WcParameters& params, WcWordCorpus* corpus, int& passnum, SymHashTable* key_words,
+   			Fr::VectorMeasure<WcWordCorpus::ID,float>* measure,
+		     	CFile& outfp, CFile& tokfp, CFile& tagfp, const char* outfilename,
+   			const char* tokfilename, const char* tagfilename)
 {
-   assertq(global_params != nullptr) ;
-   FrList *filelist = WcLoadFileList(use_stdin,listfile) ;
-   int passnum = 1 ;
-   size_t corpus_size(0) ;
-   WcParameters params(global_params) ;
-   params.downcaseSource(lowercase_source) ;
-   params.downcaseTarget(lowercase_target) ;
-   params.threadPool(new FrThreadPool(params.numThreads())) ;
-   bool monoling = params.monolingualOnly() ;
-   cout << "; Pass " << passnum++ <<": count word frequencies" << endl ;
-   FrSymHashTable *desired_words ;
-   FrSymCountHashTable *uniwordfreq
-      = count_frequencies(filelist,&params,corpus_size,desired_words) ;
-   params.desiredWords(desired_words) ;
-   WcWordPairTable *mutualinfo = nullptr ;
-   if (params.phraseLength() > 1 && params.miThreshold() > 0.0)
-      {
-      cout << "; Pass " << passnum++ << ": compute pair-wise mutual information" << endl ;
-      if (params.miThreshold() > 0.0)
-	 {
-	 num_examples = 0 ;
-	 mutualinfo = WcComputeMutualInfo(filelist,&params,uniwordfreq,corpus_size) ;
-	 }
-      FramepaC_gc();
-      }
-   params.mutualInfo(mutualinfo) ;
-   cout << "; Pass " << passnum++ << ": analyze local contexts" << endl ;
-   FrSymHashTable *key_words = new FrSymHashTable ;
-   if (two_pass_clustering)
-      {
-      cout << ";   Step A: find word-pair frequencies" << endl ;
-      only_count_pairs = true ;
-      num_examples = 0 ;
-      analyze_files(filelist,&params,key_words,WcWordDelimiters()) ;
-      FramepaC_gc();
-      only_count_pairs = false ;
-      cout << ";     (" << key_words->currentSize() << " word pairs found)"
-	   << endl ;
-      delete desired_words ;
-      desired_words = new FrSymHashTable ;
-      params.desiredWords(desired_words) ;
-      key_words->iterate(create_empty_context_list,desired_words) ;
-      cout << ";   Step B: analyze contexts for pairs occurring more than "
-	   << min_frequency << " times (" << desired_words->currentSize() << ')'
-	   << endl ;
-      only_incr_contexts = true ;
-      }
-   FramepaC_gc();
-   num_examples = 0 ;
-   analyze_files(filelist,&params,key_words,WcWordDelimiters()) ;
-   only_incr_contexts = false ;
-   params.desiredWords(0) ;
-   delete desired_words ;
-   params.mutualInfo(0) ;
-   delete mutualinfo ;
-   free_object(filelist) ;
-   cout << ";   " << key_words->currentSize() << " words found" << endl ;
-   FramepaC_gc() ;
-   WcConvertCounts2Vectors(key_words,uniwordfreq) ;
-   if (ignore_auto_clusters)
+   if (params.ignoreAutoClusters())
       WcRemoveAutoClustersFromSeeds(params.equivalenceClasses()) ;
-   if (use_seeds_for_context_only)
-      params.equivalenceClasses(0) ;
-   FramepaC_gc() ;
-   if (verbose && showmem)
-      FrMemoryStats() ;
+   Fr::gc() ;
+   if (params.runVerbosely() && params.showMemory())
+      Fr::memory_stats(cout) ;
    if (params.preFilterFunc())
       {
-      FrTimer timer ;
-      cout << "; Pass " << passnum++ << ": pre-filter term vectors" << endl ;
-      WcPreFilterVectors(key_words,uniwordfreq,params) ;
-      if (verbose)
-	 {
-	 cout << ";   filtering vectors took " << timer.readsec() << " CPU seconds." << endl ;
-	 }
+      cout << "; Pass " << passnum++ << ": pre-filter term vectors\n" ;
+      WcPreFilterVectors(key_words,params) ;
       }
-   cout << "; Pass " << passnum++ << ": cluster local contexts" << endl ;
-   WcAdjustContextWeights(key_words,params.src_context_left,
-			  params.src_context_right,uniwordfreq,corpus_size) ;
-   FrList *clusters = cluster_vectors(key_words,&params,thresholds,
-				      params.equivalenceClasses(),
-				      verbose,!keep_singletons) ;
-   cout << ";   " << clusters->listlength() << " clusters found" << endl ;
-   if (params.postFilterFunc())
+   cout << "; Pass " << passnum++ << ": cluster local contexts\n" ;
+   Timer timer ;
+   ClusterInfo* clusters = cluster_vectors(key_words,&params,corpus,
+				    params.equivalenceClasses(),measure,params.runVerbosely()) ;
+   if (!clusters)
       {
-      FrTimer timer ;
-      cout << "; Pass " << passnum++ << ": post-filter term vectors" << endl ;
-      WcPostFilterClusters(clusters,uniwordfreq,params) ;
-      if (verbose)
+      cout << ";  clustering failed\n"  ;
+      return ;
+      }
+   cout << ";   " << clusters->numSubclusters() << " clusters found in " << timer << endl ;
+   if (params.runVerbosely())
+      {
+      cout << ";   cluster sizes:" ;
+      auto sub = clusters->subclusters() ;
+      for (size_t i = 0 ; sub && i < sub->size() && i < 8 ; ++i)
 	 {
-	 cout << ";   filtering vectors took " << timer.readsec() << " CPU seconds." << endl ;
+	 auto member = static_cast<ClusterInfo*>(sub->getNth(i)) ;
+	 cout << ' ' << member->numMembers() << '+' << member->numSubclusters() ;
 	 }
+      if (sub && sub->size() > 8)
+	 cout << " ..." ;
+      cout << endl ;
       }
    if (params.clusterFilterFunc() || params.clusterPostprocFunc())
       {
-      FrTimer timer ;
-      cout << "; Pass " << passnum++ << ": post-filter clusters" << endl ;
-      clusters = WcFilterClusterMembers(clusters,uniwordfreq,params) ;
-      if (verbose)
-	 {
-	 cout << ";   filtering clusters took " << timer.readsec() << " CPU seconds." << endl ;
-	 }
+      cout << "; Pass " << passnum++ << ": post-filter clusters\n" ;
+      clusters = WcFilterClusterMembers(clusters,params) ;
       }
-   cout << "; Pass " << passnum++ << ": output equivalence classes" << endl ;
-   if (clusters)
+   if (params.postFilterFunc() || params.globalPostFilterFunc())
       {
-      const char *seedfile = params.equivClassFile() ;
-      WcOutputClusters(clusters,outfp,seedfile,monoling,WcSORT_OUTPUT,outfilename,params.skipAutoClusters()) ;
-      WcOutputTokenFile(clusters,tokfp,monoling,WcSORT_OUTPUT,tokfilename,params.skipAutoClusters(),
-			params.suppressAutoBrackets()) ;
-      WcOutputTaggedCorpus(clusters,tagfp,monoling,WcSORT_OUTPUT,tagfilename,params.skipAutoClusters()) ;
+      cout << "; Pass " << passnum++ << ": post-filter term vectors\n" ;
+      if (params.globalPostFilterFunc())
+	 WcPostFilterVectors(clusters,params) ;
+      WcPostFilterClusters(clusters,params) ;
       }
+   cout << "; Pass " << passnum++ << ": output equivalence classes\n" ;
+   const char *seedfile = params.equivClassFile() ;
+   bool no_auto = params.skipAutoClusters() && !params.reclusterSeeds() ;
+   WcOutputClusters(clusters,outfp,seedfile,WcSORT_OUTPUT,outfilename,no_auto) ;
+   WcOutputTokenFile(clusters,tokfp,WcSORT_OUTPUT,tokfilename,no_auto,
+      params.suppressAutoBrackets()) ;
+   WcOutputTaggedCorpus(clusters,tagfp,WcSORT_OUTPUT,tagfilename,no_auto) ;
    // finally, clean up
-   delete params.threadPool() ;
-   params.threadPool(0) ;
-   WcClearDisambigData() ;
-   FrEraseClusterList(clusters) ;
-   delete uniwordfreq ;
-   WcClearCounts(key_words) ;
-   delete key_words ;
-   if (verbose && showmem)
+   clusters->free() ;
+   if (params.runVerbosely() && params.showMemory())
       {
-      FramepaC_gc() ;
-      FrMemoryStats() ;
+      Fr::gc() ;
+      Fr::memory_stats(cout) ;
       }
    return ;
+}
+
+//----------------------------------------------------------------------
+
+bool WcProcessCorpus(WcWordCorpus* corpus, Fr::VectorMeasure<WcWordCorpus::ID,float>* measure,
+   			CFile& outfp, CFile& tokfp, CFile& tagfp,
+		     	const WcParameters *global_params,
+		     	const char *outfilename, const char *tokfilename, const char *tagfilename)
+{
+   if (!corpus || !corpus->corpusSize())
+      return false ;
+   int passnum(1) ;
+   WcParameters params(global_params) ;
+   cout << "; Pass " << passnum++ <<": check word frequencies\n" ;
+   tag_desired_words(corpus,&params) ;
+   if (params.wordFreqFunc())
+      {
+      // optionally invoke a callback that can modify uniwordfreqs, desired_words, or equiv_classes;
+      //   can be used to add below-freqthresh words to equiv_classes as "<rare>"
+      cout << "; Pass " << passnum++ << ": adjust word frequencies\n" ;
+      params.wordFreqFunc()(params,corpus->corpusSize()) ;
+      }
+   Ptr<WcWordIDPairTable> mutualinfo ;
+   if (params.phraseLength() > 1 && params.miThreshold() > 0.0)
+      {
+      cout << "; Pass " << passnum++ << ": compute pair-wise mutual information\n" ;
+      if (params.miThreshold() > 0.0)
+	 {
+	 mutualinfo = WcComputeMutualInfo(corpus,&params) ;
+	 }
+      }
+   params.mutualInfoID(mutualinfo) ;
+   cout << "; Pass " << passnum++ << ": analyze local contexts\n" ;
+   Fr::gc();
+   ScopedObject<SymHashTable> key_words(corpus->vocabSize()) ;
+   if (params.dimensions())
+      {
+      auto ctxt = new WcTermVector::context_coll ;
+      if (ctxt)
+	 {
+	 ctxt->setDimensions(params.dimensions()) ;
+	 ctxt->setBasisDimensions(params.basisPlus(),params.basisMinus()) ;
+	 }
+      params.contextCollection(ctxt) ;
+      }
+   analyze_contexts(corpus,&params,key_words) ;
+   params.mutualInfoID(nullptr) ;
+   mutualinfo = nullptr ;
+   corpus->discardText() ;
+   cout << ";   " << key_words->currentSize() << " terms found\n" ;
+   Fr::gc() ;
+   process_vectors(params,corpus,passnum,key_words,measure,outfp,tokfp,tagfp,
+		   outfilename,tokfilename,tagfilename) ;
+   delete params.contextCollection() ;
+   params.contextCollection(nullptr) ;
+   delete corpus ;
+   progress = nullptr ;
+   return true ;
 }
 
 //----------------------------------------------------------------------

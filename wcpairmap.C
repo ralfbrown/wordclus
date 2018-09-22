@@ -1,13 +1,13 @@
 /****************************** -*- C++ -*- *****************************/
 /*									*/
-/*  WordClust -- Word Clustering					*/
+/*  WordClust --  Word Clustering					*/
 /*  Version 2.00							*/
-/*	 by Ralf Brown							*/
+/*	by Ralf Brown							*/
 /*									*/
-/*  File: wcbatch.h	      batch-of-lines processing			*/
+/*  File: wcpairmap.C							*/
 /*  LastEdit: 21sep2018							*/
 /*									*/
-/*  (c) Copyright 2015,2016,2017,2018 Carnegie Mellon University	*/
+/*  (c) Copyright 2017,2018 Carnegie Mellon University			*/
 /*	This program may be redistributed and/or modified under the	*/
 /*	terms of the GNU General Public License, version 3, or an	*/
 /*	alternative license agreement as detailed in the accompanying	*/
@@ -22,29 +22,47 @@
 /*									*/
 /************************************************************************/
 
-#ifndef __WCBATCH_H_INCLUDED
-#define __WCBATCH_H_INCLUDED
+#include "wcpair.h"
+#include "framepac/as_string.h"
+#include "template/hashtable.cc"
 
-#include "framepac/file.h"
+namespace Fr
+{
 
-/************************************************************************/
-/*	Manifest Constants						*/
-/************************************************************************/
+// request explicit instantiation
+template class HashTable<WcWordIDPair,NullObject> ;
 
-#define WcLINES_PER_BATCH 10000
-
-/************************************************************************/
-/*	Types								*/
-/************************************************************************/
-
-typedef bool WcProcessFileFunc(const Fr::LineBatch &lines, const WcParameters *params,
-			       va_list args) ;
+} // end namespace Fr
 
 /************************************************************************/
 /************************************************************************/
 
-bool WcProcessFile(Fr::CFile& fp, const WcParameters *params, WcProcessFileFunc *fn, ...) ;
+Fr::Allocator WcWordIDPairTable::s_allocator(FramepaC::Object_VMT<WcWordIDPairTable>::instance(),sizeof(WcWordIDPairTable)) ;
+const char WcWordIDPairTable::s_typename[] = "WcWordIDPairTable" ;
 
-#endif /* !__WCBATCH_H_INCLUDED */
+/************************************************************************/
+/************************************************************************/
 
-// end of file wcbatch.h //
+size_t WcWordIDPair::cStringLength() const
+{
+   return Fr::len_as_string(m_word1) + Fr::len_as_string(m_word2) + 1 ;
+}
+
+bool WcWordIDPair::toCstring(char* buffer, size_t buflen) const
+{
+   buffer = Fr::as_string(m_word1,buffer,buflen) ;
+   if (buflen > 0)
+      *buffer++ = ':' ;
+   if (buflen > 0)
+      buffer = Fr::as_string(m_word2,buffer,buflen) ;
+   if (buflen > 0)
+      {
+      *buffer = '\0' ;
+      return true ;
+      }
+   return false ;
+}
+
+// end of file wcpairmap.C //
+
+

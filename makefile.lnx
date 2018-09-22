@@ -26,16 +26,16 @@ ifndef GDB
 endif
 
 ifeq ($(SANE),1)
-SANITIZE=-fsanitize=thread -fPIE -DHELGRIND
-LINKSAN=-pie
+SANITIZE=-fsanitize=thread -fPIC
+LINKSAN=-fPIC -pie
 else ifeq ($(SANE),2)
-SANITIZE=-fsanitize=address -fno-omit-framepointer -DPURIFY
+SANITIZE=-fsanitize=address -fno-omit-frame-pointer
 else ifeq ($(SANE),3)
-SANITIZE=-fsanitize=leak -DPURIFY
+SANITIZE=-fsanitize=leak -fno-omit-frame-pointer
 else ifeq ($(SANE),4)
-SANITIZE=-fsanitize=memory -fno-omit-framepointer
+SANITIZE=-fsanitize=memory -fno-omit-frame-pointer
 else ifeq ($(SANE),5)
-SANITIZE=-fsanitize=undefined
+SANITIZE=-fsanitize=undefined -DSANITIZING
 endif
 
 ifndef CPU
@@ -63,9 +63,9 @@ BITS=64
 endif
 
 ifeq ($(THREADS),1)
-  PTHREAD=-pthread -DFrMULTITHREAD
+  PTHREAD=-pthread
 else
-  PTHREAD=
+  PTHREAD=-DFrSINGLE_THREADED
 endif
 
 WARN=-Wall -Wno-deprecated -Wextra
@@ -81,12 +81,12 @@ LINKBITS=-m$(BITS)
 ifeq ($(CPU),99)
   # auto-detection, assuming at least AMD "K8" level of features (any
   #  x64 processor qualifies); required GCC 4.2+
-  CPUDEF=-march=native -D__886__ -D__BITS__=$(BITS)
+  CPUDEF=-march=native
 else ifeq ($(CPU),10)
   # newest AMD chips: "Barcelona", PhenomII
-  CPUDEF=-march=amdfam10 -D__886__ -D__BITS__=$(BITS)
+  CPUDEF=-march=amdfam10
 else ifeq ($(CPU),8)
-  CPUDEF=-march=k8 -msse -D__BITS__=$(BITS)
+  CPUDEF=-march=k8 -msse
 else ifeq ($(CPU),7)
   CPUDEF=-march=athlon-xp -mmmx
 else ifeq ($(CPU),6)
@@ -94,15 +94,11 @@ else ifeq ($(CPU),6)
 else
   CPUDEF=-march=i$(CPU)86 -mtune=i$(CPU)86
 endif
-ifneq ($(CPU),99)
-CPUDEF += -D__$(CPU)86__
-endif
 
 #########################################################################
 # define the compiler and its options
 
-#CC = g++ --std=c++11
-CC = g++
+CC = g++ --std=c++11
 CCLINK=$(CC)
 CFLAGS= $(WARN)
 CFLAGS +=$(CPUDEF)
@@ -112,7 +108,6 @@ CFLAGS +=$(NODEBUG)
 CFLAGS +=$(LINKBITS)
 CFLAGS +=$(EXTRAINC)
 CFLAGS +=$(SANITIZE)
-CFLAGS +=$(INCLUDEDIRS)
 CFLAGS +=$(SHAREDLIB)
 CFLAGS +=$(COMPILE_OPTS)
 CFLAGEXE = -L$(LIBINSTDIR) $(PROFILE) -o $@
@@ -126,7 +121,7 @@ ifeq ($(BUILD_DBG),2)
   CFLAGS += -ggdb3 -O0 -fno-inline -g3
 else
 ifeq ($(BUILD_DBG),1)
-  CFLAGS += -ggdb3 -O -g3
+  CFLAGS += -ggdb3 -Og -g3
 else
   CFLAGS += -O3 -fexpensive-optimizations -g$(DBGLVL) $(GDB)
 endif
@@ -166,14 +161,16 @@ C = .C
 #########################################################################
 # define the required libraries in the proper format for the OS
 
-#USELIBS = -lebmt -lframepac -lcrypt
-USELIBS = -lframepac
+USELIBS = -lframepacng
 
 #########################################################################
 # define the default compile rule
 
-$(C)$(OBJ): ; $(CC) $(CFLAGS) $(INCLUDEDIRS) -c $<
+$(C)$(OBJ): ; $(CC) $(CFLAGS) $(INCLUDEDIRS) -c -o $@ $<
 .cpp.C: ; ln -s $< $@
+build/%$(OBJ): ./%$(C)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INCLUDEDIRS) -c -o $@ $<
 
 .SUFFIXES: $(OBJ) .C $(C) .cpp
 

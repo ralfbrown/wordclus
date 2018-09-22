@@ -1,12 +1,16 @@
-# Makefile for Pangloss EBMT module
+# Makefile for WordClus
 #   (using GCC under Unix/Linux or Borland/Watcom C++ under MS-DOS/Win32)
-# Last change: 01nov15
+# Last change: 21sep2018
 
 #########################################################################
 # define the locations of all the files
 
 # the top of the source tree
-TOP = ..
+TOP = .
+
+# where to find FramepaC-ng include files
+FP = ../FramepaC-ng/framepac
+FPT = ../FramepaC-ng/template
 
 # where to put the compiled library and required header files
 INSTDIR = $(TOP)/include
@@ -16,7 +20,7 @@ LIBINSTDIR = $(TOP)/lib
 BINDIR = $(TOP)/bin
 
 # where to look for header files from other modules when compiling
-INCLUDEDIRS = -I$(TOP)/include
+INCLUDEDIRS = -I$(TOP)/FramepaC-ng -I$(TOP)/include
 
 #########################################################################
 # define the compiler and its options
@@ -26,10 +30,11 @@ INCLUDEDIRS = -I$(TOP)/include
 
 #include makefile.unx		# GNU C under Unix
 include makefile.lnx		# GNU C under Linux (default: x86 version)
-#!include makefile.bcc		# Borland C++ under MS-DOS
-#!include makefile.wcc		# Watcom C++ under MS-DOS, for DOS/4GW extender
-#!include makefile.nt		# Watcom C++, building Windows NT executable
 #!include makefile.vc		# Visual C++ under Windows (NT/95)
+
+
+## uncommment the following line to enable corpora up to 1 trillion tokens instead of 4 billion
+#CFLAGS += -DHUGE_CORPUS
 
 #########################################################################
 #  define the various files to be used
@@ -38,17 +43,24 @@ include makefile.lnx		# GNU C under Linux (default: x86 version)
 PACKAGE = wordclus
 
 # the object modules to be included in the library file
-OBJS = wcwrdinf$(OBJ) wctrmvec$(OBJ) wcclust$(OBJ) wcanalyz$(OBJ) \
-	wcconfig$(OBJ) wcgram$(OBJ) wcbatch$(OBJ) \
-	wcoutput$(OBJ) wcutil$(OBJ) wcmain$(OBJ) \
-	wctoken$(OBJ) wcglobal$(OBJ)
+OBJS = build/wctrmvec$(OBJ) \
+	build/wcclust$(OBJ) \
+	build/wcbatch$(OBJ) \
+	build/wcdelim$(OBJ) \
+	build/wcoutput$(OBJ) \
+	build/wcmain$(OBJ) \
+	build/gencorpus$(OBJ) \
+	build/wcidhash$(OBJ) \
+	build/wcglobal$(OBJ) \
+	build/wcpairmap$(OBJ) \
+	build/wcparam$(OBJ)
 
 # the header files needed by applications using this library
 HEADERS = wordclus.h
 
 # files to be included in the source distribution archive
-DISTFILES = COPYING GPL.txt makefile makefile.?nx makefile.?cc makefile.?? *.h *$(C) \
-	objs.lst vcobjs.lst rblib.bat
+DISTFILES = COPYING LICENSE makefile makefile.?nx makefile.?? *.h *$(C)
+#	wordclus/*.h src/*$(C)
 
 # the library archive file for this module
 LIBRARY = $(PACKAGE)$(LIB)
@@ -82,11 +94,12 @@ help:
 lib:	$(LIBRARY)
 
 clean:
-	$(RM) *$(OBJ)
+	$(RM) build/*$(OBJ)
 	$(RM) $(LIBRARY)
 	$(RM) $(TESTPROG)$(EXE)
 
 veryclean: clean
+	$(RM) build/*$(OBJ)
 	$(RM) *.BAK
 	$(RM) *.CKP *~
 	$(RM) "#*#"
@@ -96,10 +109,11 @@ install: $(LIBINSTDIR)/$(LIBRARY)
 system: $(BINDIR)/$(TESTPROG)$(EXE)
 
 bootstrap:
+	@mkdir -p build
 
 tags:
-	etags --c++ *.h *$(C) $(TOP)/ebmt/src/*.h $(TOP)/ebmt/src/*$(C) \
-		$(TOP)/framepac/src/*.h $(TOP)/framepac/src/*$(C)
+	etags --c++ *.h *$(C) \
+		$(FP)/*.h $(TOP)/FramepaC-ng/src/*$(C) $(TOP)/FramepaC-ng/template/*.cc
 
 tar:
 	$(RM) $(PACKAGE).tar
@@ -134,20 +148,38 @@ $(BINDIR)/$(TESTPROG)$(EXE): $(TESTPROG)$(EXE)
 #########################################################################
 
 # the dependencies for each module of the full package
-wcanalyz$(OBJ):		wcanalyz$(C) wordclus.h wctoken.h
-wcbatch$(OBJ):		wcbatch$(C) wordclus.h wcbatch.h wcglobal.h
-wcclust$(OBJ):		wcclust$(C) wordclus.h
-wcconfig$(OBJ):		wcconfig$(C) wordclus.h wcconfig.h wcglobal.h
-wcglobal$(OBJ):		wcglobal$(C) wordclus.h wcglobal.h wcconfig.h
-wcgram$(OBJ):		wcgram$(C) wordclus.h wctoken.h wcglobal.h
-wcmain$(OBJ):		wcmain$(C) wordclus.h wcbatch.h wcglobal.h
-wcoutput$(OBJ):		wcoutput$(C) wordclus.h
-wctoken$(OBJ):		wctoken$(C) wctoken.h wordclus.h wcglobal.h
-wctrmvec$(OBJ):		wctrmvec$(C) wordclus.h wcglobal.h
-wcutil$(OBJ):		wcutil$(C) wordclus.h
-wcwrdinf$(OBJ):		wcwrdinf$(C) wordclus.h
+build/gencorpus$(OBJ):	gencorpus$(C) wordclus.h wcbatch.h wcparam.h $(FP)/threadpool.h \
+			$(FP)/progress.h $(FP)/string.h $(FP)/symboltable.h $(FP)/texttransforms.h $(FP)/words.h 
+build/wcbatch$(OBJ):		wcbatch$(C) wordclus.h wcbatch.h wcparam.h \
+			$(FP)/texttransforms.h $(FP)/threadpool.h
+build/wcclust$(OBJ):		wcclust$(C) wordclus.h wctrmvec.h wcparam.h \
+			$(FP)/message.h $(FP)/symboltable.h
+build/wcdelim$(OBJ):		wcdelim$(C) wordclus.h
+build/wcglobal$(OBJ):	wcglobal$(C) wordclus.h
+build/wcidhash$(OBJ):	wcidhash$(C) wordclus.h $(FPT)/hashtable.cc
+build/wcmain$(OBJ):		wcmain$(C) wordclus.h wcbatch.h wcpair.h wctrmvec.h wcparam.h
+build/wcoutput$(OBJ):	wcoutput$(C) wordclus.h wctrmvec.h
+build/wcpairmap$(OBJ):	wcpairmap$(C) wcpair.h
+build/wcparam$(OBJ):		wcparam$(C) wcparam.h wordclus.h $(FP)/cluster.h $(FP)/stringbuilder.h \
+			$(FP)/texttransforms.h
+build/wctrmvec$(OBJ):	wctrmvec$(C) wordclus.h wctrmvec.h $(FP)/memory.h $(FP)/symboltable.h
 
-$(TESTPROG)$(OBJ):	$(TESTPROG)$(C) wordclus.h wcconfig.h wcglobal.h
+$(TESTPROG)$(OBJ):	$(TESTPROG)$(C) wordclus.h wcparam.h \
+			$(FP)/argparser.h $(FP)/symboltable.h $(FP)/memory.h $(FP)/timer.h \
+			$(FP)/stringbuilder.h
+
+wcbatch.h:		$(FP)/file.h
+	$(TOUCH) $@
+
+wcparam.h:		$(FP)/contextcoll.h $(FP)/cstring.h $(FP)/hashtable.h
+	$(TOUCH) $@
+
+wctrmvec.h:		$(FP)/list.h $(FP)/vecsim.h wcparam.h
+	$(TOUCH) $@
+
+wordclus.h:		$(FP)/cluster.h $(FP)/file.h $(FP)/hashtable.h $(FP)/list.h \
+			$(FP)/threshold.h $(FP)/wordcorpus.h
+	$(TOUCH) $@
 
 # End of Makefile
 

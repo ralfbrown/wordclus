@@ -1,45 +1,43 @@
 /************************************************************************/
 /*									*/
-/*  WordClust -- Bilingual Word Clustering				*/
-/*  Version 1.40							*/
+/*  WordClust -- Word Clustering					*/
+/*  Version 2.00							*/
 /*	 by Ralf Brown							*/
 /*									*/
 /*  File: wordclus.cpp	      word clustering (main program)		*/
-/*  LastEdit: 08nov2015							*/
+/*  LastEdit: 21sep2018							*/
 /*									*/
-/*  (c) Copyright 1999,2000,2001,2002,2003,2005,2006,2009,2010,2015	*/
-/*		 Ralf Brown/Carnegie Mellon University			*/
-/*	This program is free software; you can redistribute it and/or	*/
-/*	modify it under the terms of the GNU Lesser General Public 	*/
-/*	License as published by the Free Software Foundation, 		*/
-/*	version 3.							*/
+/*  (c) Copyright 1999,2000,2001,2002,2003,2005,2006,2009,2010,2015,	*/
+/*		2016,2017,2018 Carnegie Mellon University		*/
+/*	This program may be redistributed and/or modified under the	*/
+/*	terms of the GNU General Public License, version 3, or an	*/
+/*	alternative license agreement as detailed in the accompanying	*/
+/*	file LICENSE.  You should also have received a copy of the	*/
+/*	GPL (file COPYING) along with this program.  If not, see	*/
+/*	http://www.gnu.org/licenses/					*/
 /*									*/
 /*	This program is distributed in the hope that it will be		*/
 /*	useful, but WITHOUT ANY WARRANTY; without even the implied	*/
 /*	warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR		*/
-/*	PURPOSE.  See the GNU Lesser General Public License for more 	*/
-/*	details.							*/
-/*									*/
-/*	You should have received a copy of the GNU Lesser General	*/
-/*	Public License (file COPYING) and General Public License (file	*/
-/*	GPL.txt) along with this program.  If not, see			*/
-/*	http://www.gnu.org/licenses/					*/
+/*	PURPOSE.  See the GNU General Public License for more details.	*/
 /*									*/
 /************************************************************************/
 
-#include "wcconfig.h"
-#include "wordclus.h"
-#include "wcglobal.h"
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
 
-#ifdef FrSTRICT_CPLUSPLUS
-#  include <cmath>
-#  include <cstdlib>
-#  include <fstream>
-#else
-#  include <fstream.h>
-#  include <math.h>
-#  include <stdlib.h>
-#endif
+#include "framepac/argparser.h"
+#include "framepac/memory.h"
+#include "framepac/message.h"
+#include "framepac/stringbuilder.h"
+#include "framepac/symboltable.h"
+#include "framepac/timer.h"
+
+#include "wordclus.h"
+#include "wcparam.h"
+
+using namespace Fr ;
 
 /************************************************************************/
 /*	Manifest Constants						*/
@@ -62,6 +60,15 @@ static int phrase_size = 1 ;
 static double min_phrase_MI = 0.05 ;
 static int mono_skip = 0 ;
 
+static const char* input_token_file = nullptr;
+static const char* output_corpus_file = nullptr ;
+static const char* seed_class_file = nullptr ;
+static const char* context_equiv_file = nullptr ;
+static size_t desired_clusters = 2000 ;
+static size_t backoff_step = 5 ;
+
+static WcParameters params ;
+
 /************************************************************************/
 /************************************************************************/
 
@@ -75,126 +82,46 @@ static void banner(ostream &out)
 
 //----------------------------------------------------------------------
 
-static void usage(const char *argv0)
-{
+#if 0
    cerr << "Usage: " << argv0 << " [options] outfile dictionary [infile-list]\n"
 	   "Options:\n"
-           "\t=FILE\tload configuration info from FILE\n"
-           "\t-#N\tgenerate no more than N clusters (default 2000)\n"
-           "\t-1\tinput files are monolingual\n"
-           "\t-a\tremove ambiguous terms from clusters\n"
-	   "\t-A#\tallow at most # possibilities for building a word pair\n"
-           "\t-bX\tweight sentence boundary by factor of X\n"
-           "\t-cmNAME\tuse clustering measure NAME (COS,EUCL,JACC,DICE,...)\n"
-           "\t-crNAME\tuse cluster representative NAME (CENT,NEAR,AVG,RMS,...)\n"
-           "\t-ctNAME\tuse clustering type NAME (INCR,INCR2,AGG,TIGHT,...)\n"
-           "\t-C+\tadd cluster sizes when merging, instead of using larger\n"
            "\t-d\tdecay weights inversely based on distance from key word\n"
-	   "\t-ddX\tdiscount context frequencies by raising to power X (0..1)\n"
            "\t-dfX,Y\tdecay weights based on inverse term freq of context words\n"
            "\t-deX\tdecay weights exponentially based on dist from key word\n"
            "\t-dl\tdecay weights linearly based on distance from key word\n"
            "\t-dwX,Y\tdecay weights based on context word frequencies\n"
-           "\t-eFILE\tload initial equivalence classes from FILE\n"
-           "\t-e:FILE\tload initial equiv classes from FILE, ignoring auto clusters\n"
-           "\t-e=FILE\tuse equivalence classes from FILE for context only\n"
-           "\t-EFILE\twrite resulting equivalence classes to FILE\n"
-           "\t-fN\tdon't try to cluster words occurring less than N times\n"
-           "\t-f@N\tcluster only the N most frequent words\n"
-           "\t-f-N\tdon't try to cluster words occurring more than N times\n"
-           "\t-f-@N\ttreat the N most frequent words as stopwords\n"
-           "\t-i\tdon't preserve case of input text\n"
-           "\t-l\tforce target-language output to lower case\n"
-           "\t-ls\ttoggle downcasing source-language input before processing\n"
-	   "\t\t\t(default is enabled)\n"
-           "\t-lt\ttoggle downcasing target-language input before processing\n"
-           "\t-m\tshow memory usage\n"
-           "\t-nN\tuse 'neighborhood' of +/- N (0-9) words as context\n"
            "\t-ntN\tuse target-lang 'neighborhood' of +/- N words as context\n"
-           "\t-N\tkeep numbers in a distinct cluster\n"
-           "\t-oN\tword-order similarity: allow N-word offset in positions\n"
-           "\t-OFILE\toutput clusters to FILE as tagged EBMT corpus\n"
-           "\t-pN,M\tcluster phrases up to length N (1-9) with MutInfo >= M\n"
-           "\t-P\tkeep punctuation distinct from non-punctuation\n"
-           "\t-r\treverse direction by swapping source/target languages\n"
-           "\t-s\tuse standard input as corpus\n"
-           "\t-SFILE\tread stopwords (for clustering) from FILE\n"
-           "\t-tX\tset clustering threshold to X (0.0-1.0)\n"
-           "\t-t=FILE\tset variable clustering thresholds from FILE\n"
-           "\t-TFILE\tcopy equiv classes from FILE to -E output file\n"
-           "\t-Ux\tuse character set 'x' (Latin-1, Latin-2, GB-2312, EUC, etc.)\n"
-           "\t-Ub\tbyte-swap characters when using Unicode character set\n"
-	   "\t-v\trun verbosely\n"
-//           "\t-wFILE\tload TF*IDF weights from FILE\n"
-           "\t-W\ttreat contexts as whole phrases rather than bags of words\n"
-           "\t-WW\ttreat left and right contexts as a single phrase with a gap\n"
-	   "\t-xn\texclude numbers (digit strings) from clustering\n"
-	   "\t-xp\texclude punctuation from clustering\n"
 	<< endl ;
-   exit(EXIT_FAILURE) ;
-   return ;
 }
+#endif /* 0 */
 
 //----------------------------------------------------------------------
 
-static void set_flag_var(bool &flag, char option)
-{
-   if (option == '+')
-      flag = true ;
-   else if (option == '-')
-      flag = false ;
-   else
-      flag = !flag ;
-   return ;
-}
-
-//----------------------------------------------------------------------
-
-static void make_seeds(const char *seed_class_file, FrObjHashTable *seeds)
+static void make_seeds(const char *seed_class_file, SymHashTable *seeds, bool run_verbosely)
 {
    if (seed_class_file && seeds)
       {
       size_t count(0) ;
-      FILE *fp = fopen(seed_class_file,"r") ;
-      FrSymbol *symEOF = makeSymbol("*EOF*") ;
+      CInputFile fp(seed_class_file) ;
       if (fp)
 	 {
-	 while (!feof(fp))
+	 SymbolTable* symtab = SymbolTable::current() ;
+	 while (CharPtr line { fp.getCLine() })
 	    {
-	    char line[FrMAX_LINE] ;
-	    if (!fgets(line,sizeof(line),fp))
-	       break ;
-	    char *lineptr = line ;
-	    FrObject *o1 = string_to_FrObject(lineptr) ;
-	    FrObject *o2 = string_to_FrObject(lineptr) ;
-	    FrObject *o3 = string_to_FrObject(lineptr) ;
+	    char* lineptr = *line ;
+	    ScopedObject<> o1(lineptr) ;
+	    ScopedObject<> o2(lineptr) ;
 	    if (o1 && o1->printableName() &&
-		o2 && o2->printableName() && o3 != symEOF)
+		o2 && o2->printableName())
 	       {
-	       FrSymbol *word1 = FrCvt2Symbol(o1) ;
-	       FrSymbol *classname = FrCvt2Symbol(o2) ;
-	       FrSymbol *word2 = nullptr ;
-	       if (o3 && o3->printableName() && !monolingual)
-		  word2 = FrCvt2Symbol(o3) ;
-	       FrString *keystr = new FrString(word1->printableName()) ;
-	       if (word2)
-		  {
-		  (*keystr) += "\t" ;
-		  (*keystr) += word2->printableName() ;
-		  }
-	       if (seeds->add(keystr,classname))
-		  {
-		  delete keystr ;	// already in hash table
-		  }
+	       Symbol* key = symtab->add(o1->printableName()) ;
+	       Symbol* classname = symtab->add(o2->printableName()) ;
+	       (void)seeds->add(key,classname) ;
 	       count++ ;
 	       }
-	    free_object(o1) ;
-	    free_object(o2) ;
-	    free_object(o3) ;
 	    }
-	 fclose(fp) ;
 	 }
-      if (verbose)
+      if (run_verbosely)
 	 cout << ";[ "<< count <<" word pairs have initial classes assigned ]"
 	      << endl ;
       }
@@ -203,9 +130,7 @@ static void make_seeds(const char *seed_class_file, FrObjHashTable *seeds)
 
 //----------------------------------------------------------------------
 
-static void extract_desired_clusters(const char *options,
-				     size_t &desired_clusters,
-				     size_t &backoff_step)
+static bool extract_desired_clusters(const char *options)
 {
    char *end = nullptr ;
    if (*options)
@@ -226,74 +151,122 @@ static void extract_desired_clusters(const char *options,
    else
       cout << "Usage for -#:   -#<num_clusters>[,<backoff_step>]"
 	   << endl ;
-   return ;
+   return true ;
 }
 
 //----------------------------------------------------------------------
 
-static void extract_neighborhood_size(const char *options)
+static bool extract_neighborhood_size(const char *options)
 {
-   if (*options == 't')
+   if (isdigit(*options) && *options != '0')
       {
-      options++ ;
-      if (Fr_isdigit(*options) && *options != '0')
+      params.neighborhoodLeft(*options - '0') ;
+      params.neighborhoodRight(params.neighborhoodLeft()) ;
+      ++options ;
+      if (*options == ',')
 	 {
-	 tl_context_l = *options - '0' ;
-	 tl_context_r = tl_context_l ;
-	 ++options ;
-	 if (*options == ',')
-	    {
-	    options++ ;
-	    if (Fr_isdigit(*options) && *options != '0')
-	       tl_context_r = *options - '0' ;
-	    }
+	 options++ ;
+	 if (isdigit(*options) && *options != '0')
+	    params.neighborhoodRight(*options - '0') ;
 	 }
       }
-   else
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+static bool set_cluster_metric(const char* opt)
+{
+   params.clusteringMeasure(opt) ;
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+static bool set_cluster_rep(const char* opt)
+{
+   params.clusteringRep(opt) ;
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+static bool set_cluster_method(const char* opt)
+{
+   //TODO: validate that the named method exists
+   params.clusteringMethod(opt) ;
+   return true ;
+}
+
+//----------------------------------------------------------------------
+
+static bool extract_distance_decay(const char *option)
+{
+   if (*option == 'w')
       {
-      if (Fr_isdigit(*options) && *options != '0')
+      // set up the word-frequency-based weighting
+      //  beta is how fast the weight decays with increasing freq
+      //  gamma is the saturation point (minimum weight)
+      char *end = nullptr ;
+      params.m_decay_beta = strtod(option+1,&end) ;
+      if (end != option+1 && *end == ',')
 	 {
-	 neighborhood_left = *options - '0' ;
-	 neighborhood_right = neighborhood_left ;
-	 ++options ;
-	 if (*options == ',')
-	    {
-	    options++ ;
-	    if (Fr_isdigit(*options) && *options != '0')
-	       neighborhood_right = *options - '0' ;
-	    }
+	 params.m_decay_gamma = strtod(end+1,0) ;
+	 if (params.m_decay_gamma < 0.0)
+	    params.m_decay_gamma = 0.0 ;
 	 }
       }
-   if (tl_context_l > neighborhood_left)
+   else if (*option == 'f')
       {
-      FrWarning("target-language left context may not be larger than the\n"
-		"\tsource-language left context; adjusted") ;
-      tl_context_l = neighborhood_left ;
+      // set up the inverse-term-frequency weighting
+      char *end = nullptr ;
+      double decay = strtod(option+1,&end) ;
+      if (end != option+1)
+	 {
+	 if (decay < 0.01) decay = 0.01 ;
+	 params.m_decay_beta = -decay ;
+	 }
+      else
+	 params.m_decay_beta = -1.0 ;
       }
-   return ;
+   else if (*option != 'd')
+      {
+      switch (*option)
+	 {
+	 case 'l':	params.m_decay_type = Decay_Linear ;	 break ;
+	 case 'e':	params.m_decay_type = Decay_Exponential ; break ;
+	 case 'n':	params.m_decay_type = Decay_None ;	 break ;
+	 default:	params.m_decay_type = Decay_Reciprocal ;	 break ;
+	 }
+      if (params.m_decay_type == Decay_Exponential)
+	 {
+	 // alpha controls how fast the weight decays with distance
+	 params.m_decay_alpha = strtod(option+1,0) ;
+	 if (params.m_decay_alpha <= 0.0)
+	    params.m_decay_alpha = 0.5 ;
+	 }
+      }
+   return true ;
 }
 
 //----------------------------------------------------------------------
 
-static void extract_null_weight(const char *option)
+static bool extract_seed_file(const char* opt)
 {
-   char *end = nullptr ;
-   double value = strtod(option,&end) ;
-   if (end && end != option && value >= 0.0 && value <= 2.0)
+   if (opt[0] == ':')
       {
-      past_boundary_weight = value ;
-      return ;
+      params.ignoreAutoClusters(true) ;
+      opt++ ;
       }
-   cerr << "; You must specify a weight between 0.0 and 2.0 for the -b option"
-	<< endl ;
-   return ;
+   seed_class_file = opt ; // use FILE for context equivs
+   return true ;
 }
 
 //----------------------------------------------------------------------
 
-static void extract_phrase_limits(const char *option)
+static bool extract_phrase_limits(const char *option)
 {
-   if (Fr_isdigit(*option) && *option != '0')
+   if (isdigit(*option) && *option != '0')
       {
       phrase_size = *option++ - '0' ;
       if (*option == ',')
@@ -311,396 +284,144 @@ static void extract_phrase_limits(const char *option)
 	    }
 	 }
       }
-   return ;
+   return true ;
 }
 
 //----------------------------------------------------------------------
 
-static void load_stopwords(const char *stopwords_file)
+static bool extract_unicode_options(const char* opt)
 {
-   if (stopwords_file && *stopwords_file)
-      {
-#if __GNUC__ == 3 && __GNUC_MINOR_ < 10
-      // !*(@$_%( broken libstdc++   (ifstream::eof() is always false!)
-      FILE *sw = fopen(stopwords_file,"r") ;
-      if (sw)
-	 {
-	 size_t count(0) ;
-	 while (!feof(sw))
-	    {
-	    char buffer[FrMAX_LINE] ;
-	    buffer[0] = '\0' ;
-	    if (!fgets(buffer,sizeof(buffer),sw))
-	       break ;
-	    if (buffer[0])
-	       {
-	       char *bufptr = buffer ;
-	       FrObject *obj = string_to_FrObject(bufptr) ;
-	       FrSymbol *word = FrCvt2Symbol(obj) ;
-	       if (word && word != makeSymbol("*EOF*"))
-		  {
-		  word->defineRelation(word) ;
-		  count++ ;
-		  }
-	       free_object(obj) ;
-	       }
-	    }
-	 cout << ";[ loaded " << count << " stopwords from "
-	      << stopwords_file << " ]" << endl ;
-	 }
-#else
-      ifstream sw(stopwords_file) ;
-      if (sw.good())
-	 {
-	 sw.clear() ;
-	 size_t count(0) ;
-	 while (!sw.eof())
-	    {
-	    FrObject *obj ;
-	    sw >> obj ;
-	    if (obj)
-	       {
-	       FrSymbol *word = FrCvt2Symbol(obj) ;
-	       if (word)
-		  {
-		  word->defineRelation(word) ;
-		  count++ ;
-		  }
-	       if (obj == makeSymbol("*EOF*"))
-		  break ;
-	       free_object(obj) ;
-	       }
-	    }
-	 cout << "; loaded " << count << " stopwords from "
-	      << stopwords_file << endl ;
-	 }
-#endif /* __GNUC__ */
-      }
-   return ;
+   WcSetCharEncoding(opt) ;
+   return true ;
 }
 
 //----------------------------------------------------------------------
 
 int main(int argc, char **argv)
 {
+   const char* clustering_settings { nullptr } ;
+   size_t clustering_iter { 5 } ;
+   size_t min_frequency   { 2 } ;
+   size_t max_frequency   { ULONG_MAX } ;
+   size_t max_term_count  { ULONG_MAX } ;
+   size_t stop_term_count { 0 } ;
+   bool lowercase_output  { false } ;
+   bool lowercase_source  { false } ;
+   bool exclude_numbers   { false } ;
+   bool exclude_punct     { false } ;
+   bool verbose           { false } ;
+   bool showmem           { false } ;
+
    banner(cout) ;
    // process the commandline arguments
-   const char *argv0 = argv[0] ;	// remember program name
-   bool use_stdin = false ;
-   char *weights_file = nullptr ;
-   char *seed_class_file = nullptr ;
-   const char *stopwords_file = nullptr ;
-   const char *token_file = nullptr ;
-   const char *input_token_file = nullptr;
-   const char *output_corpus_file = nullptr ;
+   const char* weights_file = nullptr ;
+   const char* stopwords_file = nullptr ;
+   const char* token_file = nullptr ;
    double threshold = DEFAULT_THRESHOLD ;
-   size_t desired_clusters = 2000 ;
-   size_t backoff_step = 5 ;
-   initialize_FramepaC() ;
-   FrSymbolTable *sym_t = FrSymbolTable::selectDefault() ;
-   sym_t->expand(300000L) ;		// reduce memory fragmentation
-   sym_t->select() ;
-   WcSetCharEncoding("Latin1") ;
-   // load in the configuration file, if one is specified
-   for (int arg = 1 ; arg < argc ; arg++)
+   Fr::Initialize() ;
+   WcSetCharEncoding("en_US.iso8859-1") ;
+
+   ArgParser cmdline_flags ;
+   cmdline_flags
+      .addFunc(extract_desired_clusters,"#","numclusters","N[,B]\vgenerate no more than N clusters (default 200)\nback off threshold by B if less than N")
+      .add(mono_skip,"1s","use-source","extract source-language lines from bilingual input",+1)
+      .add(mono_skip,"1t","use-target","extract target-language lines from bilingual input",-1)
+      .add(params.m_past_boundary_weight,"b","nullweight","X\vweight sentence boundary by factor of X",0.0,2.0)
+      .addFunc(set_cluster_metric,"cm","","METRIC\vselect clustering measure METRIC (COS,EUCL,JACC,DICE,...)")
+      .addFunc(set_cluster_rep,"cr","","REP\vselect clustering representative REP (CENT,NEAR,AVG,RMS,...)")
+      .addFunc(set_cluster_method,"ct","","METH\vselect clustering method METH (INCR,AGG,TIGHT,...)")
+      .add(clustering_iter,"ci","cluster-iter","N\vset maximum number of clustering iterations to N")
+      .add(clustering_settings,"cp","cluster-params","X\vset optional clustering parameter(s) to X")
+      .add(params.m_termfreq_discount,"dd","","X\vdiscount context frequencies by raising to power X",0.0,2.0)
+      .addFunc(extract_distance_decay,"d","","-deX decay weights exponentially, -dfX,Y, -dl, -dwX -d")
+      .add(context_equiv_file,"e=","","FILE\vuse equivalence classes from FILE for context only")
+      .addFunc(extract_seed_file,"e","","FILE\vload initial equiv classes from FILE (ignore auto clusters if :FILE)")
+      .add(token_file,"E","","FILE\vwrite resulting equivalence classes to FILE")
+      .add(max_term_count,"f@","maxterms","N\vcluster only the N most frequent terms")
+      .add(max_frequency,"f-","maxfreq","N\vdon't try to cluster terms occurrent more than N times")
+      .add(stop_term_count,"f-@","stopcount","N\vtreat the N most frequent terms as stopwords")
+      .add(min_frequency,"f","minfreq","N\vdon't try to cluster terms occurring less than N times")
+      .add(lowercase_source,"i","","ignore input case (lowercase input)")
+      .add(lowercase_output,"l","","force output to lowercase")
+      .add(showmem,"m","showmem","show memory usage")
+      .addFunc(extract_neighborhood_size,"n","","N\vuse 'neighborhood' of +/- N (0-9) words as context")
+      .add(params.m_distinct_numbers,"N","sep-numbers","put numbers in separate clusters")
+      .add(output_corpus_file,"O","output","FILE\voutput clusters to FILE as tagged EBMT corpus")
+      .addFunc(extract_phrase_limits,"p","","N,M\vcluster phrsaes up to length N (1-9) with mutualinfo >= M")
+      .add(params.m_distinct_punct,"P","sep-punct","put punctuation in separate clusters")
+      .add(stopwords_file,"S","stopwords","FILE\vread stopwords (for clustering) from FILE")
+      .add(threshold,"t","","X\vset clustering threshold to X (0.0-1.0)",0.0,1.0)
+      .add(input_token_file,"T","","FILE\vcopy equiv classes from FILE to -E output file")
+      .addFunc(extract_unicode_options,"U","","x\vuse character set 'x' (Latin-1, Latin-2, GB-2312, EUC, etc.)")
+      .add(verbose,"v","verbose","run verbosely")
+      .add(weights_file,"w","","FILE\vload TF*IDF weights from FILE")
+      .add(exclude_numbers,"xn","nonumbers","exclude numbers from clustering")
+      .add(exclude_punct,"xp","nopunct","exclude punctuation from corpus")
+      .addHelp("h","","show this usage summary") ;
+   if (!cmdline_flags.parseArgs(argc,argv) || argc < 3)
       {
-      if (argv[arg][0] == '=')
-	 {
-	 WcConfig *config = get_WordClus_setup_file(argv[arg]+1,argv[0],cerr) ;
-	 if (!config)
-	    exit(1) ;
-	 apply_WordClus_configuration(config) ;
-	 }
-      else if (argv[arg][0] != '-')
-	 break ;
+      cmdline_flags.showHelp() ;
+      return 1 ;
       }
-   // next, handle all the other commandline flags (this allows the
-   //   commandline to override things in the configuration file)
-   for ( ;
-	argc > 1 && (argv[1][0] == '-' || argv[1][0] == '=') ;
-	argc--, argv++)
-      {
-      if (argv[1][0] == '=')
-	 continue ;			// already handled
-      char option = argv[1][2] ;
-      switch (argv[1][1])
-	 {
-	 case '#':
-	    extract_desired_clusters(argv[1]+2,desired_clusters,backoff_step) ;
-	    break ;
-	 case '1':
-	    monolingual = true ;
-	    if (option == 's')
-	       mono_skip = +1 ;
-	    else if (option == 't')
-	       mono_skip = -1 ;
-	    break ;
-	 case '2':
-	    two_pass_clustering = true ;
-	    break ;
-	 case 'a':
-	    remove_ambig_terms = true ;
-	    break ;
-	 case 'A':
-	    max_wordpair_ambig = atoi(argv[1]+2) ;
-	    if (max_wordpair_ambig < 1)
-	       max_wordpair_ambig = 1 ;
-	    break ;
-	 case 'b':
-	    extract_null_weight(argv[1]+2) ;
-	    break ;
-	 case 'c':
-	    if (option == 'm')
-	       clustering_metric = FrParseClusterMetric(argv[1]+3,&cerr) ;
-	    else if (option == 'r')
-	       clustering_rep = FrParseClusterRep(argv[1]+3,&cerr) ;
-	    else if (option == 't')
-	       clustering_method = FrParseClusterMethod(argv[1]+3,&cerr) ;
-	    else if (option == 'i')
-	       clustering_iter = atoi(argv[1]+3) ;
-	    else if (option == 'p')
-	       clustering_settings = argv[1]+3 ;
-	    break ;
-	 case 'C':
-	    sum_cluster_sizes = (option == '+') ;
-	    break ;
-	 case 'd':
-	    if (option == 'd')
-	       {
-	       char *end = nullptr ;
-	       double disc = strtod(argv[1]+3,&end) ;
-	       if (end != argv[1]+3 && disc > 0.0 && disc <= 2.0)
-		  termfreq_discount = disc ;
-	       else
-		  cerr << "Warning: -ddX requires 0.0 < X <= 2.0; using default of " << termfreq_discount << endl ;
-	       }
-	    else if (option == 'w')
-	       {
-	       // set up the word-frequency-based weighting
-	       //  beta is how fast the weight decays with increasing freq
-	       //  gamma is the saturation point (minimum weight)
-	       char *end = nullptr ;
-	       decay_beta = strtod(argv[1]+3,&end) ;
-	       if (end != argv[1]+3 && *end == ',')
-		  {
-		  decay_gamma = strtod(end+1,0) ;
-		  if (decay_gamma < 0.0)
-		     decay_gamma = 0.0 ;
-		  }
-	       }
-	    else if (option == 'f')
-	       {
-	       // set up the inverse-term-frequency weighting
-	       char *end = nullptr ;
-	       double decay = strtod(argv[1]+3,&end) ;
-	       if (end != argv[1]+3)
-		  {
-		  if (decay < 0.01) decay = 0.01 ;
-		  decay_beta = -decay ;
-		  }
-	       else
-		  decay_beta = -1.0 ;
-	       }
-	    else
-	       {
-	       switch (option)
-		  {
-		  case 'l':	decay_type = Decay_Linear ;	 break ;
-		  case 'e':	decay_type = Decay_Exponential ; break ;
-		  case 'n':	decay_type = Decay_None ;	 break ;
-		  default:	decay_type = Decay_Reciprocal ;	 break ;
-		  }
-	       if (decay_type == Decay_Exponential)
-		  {
-		  // alpha controls how fast the weight decays with distance
-		  decay_alpha = strtod(argv[1]+3,0) ;
-		  if (decay_alpha <= 0.0)
-		     decay_alpha = 0.5 ;
-		  }
-	       }
-	    break ;
-	 case 'e':
-	    if (option == '=')
-	       {
-	       use_seeds_for_context_only = true ;
-	       seed_class_file = argv[1]+3 ; // use FILE for context equivs
-	       }
-	    else if (option == ':')
-	       {
-	       ignore_auto_clusters = true ;
-	       seed_class_file = argv[1]+3 ; // use FILE for context equivs
-	       }
-	    else
-	       seed_class_file = argv[1]+2 ; // load initial classes from FILE
-	    break ;
-	 case 'E':
-	    token_file = argv[1]+2 ;
-	    break ;
-	 case 'f':
-	    if (option == '@')
-	       max_term_count = atoi(argv[1]+3) ;
-	    if (option == '-')
-	       {
-	       if (argv[1][3] == '@')
-		  stop_term_count = atoi(argv[1]+4) ;
-	       else
-		  max_frequency = atoi(argv[1]+3) ;
-	       }
-	    else
-	       min_frequency = atoi(argv[1]+2) ;
-	    break ;
-	 case 'i':
-	    lowercase_source = true ;
-	    break ;
-         case 'l':
-	    if (option == 's')
-	       set_flag_var(lowercase_source,argv[1][3]) ;
-	    else if (option == 't')
-	       set_flag_var(lowercase_target,argv[1][3]) ;
-	    else if (!option)
-	       lowercase_output = true ;
-	    break ;
-	 case 'm':
-	    showmem = true ;
-	    break ;
-	 case 'n':
-	    extract_neighborhood_size(argv[1]+2) ;
-	    break ;
-	 case 'N':
-	    keep_numbers_distinct = true ;
-	    break ;
-	 case 'o':
-	    if (Fr_isdigit(option))
-	       word_order_similarity = option - '0' ;
-	    break ;
-	 case 'O':
-	    output_corpus_file = argv[1]+2 ;
-	    break ;
-	 case 'p':
-	    extract_phrase_limits(argv[1]+2) ;
-	    break ;
-	 case 'P':
-	    keep_punctuation_distinct = true ;
-	    break ;
-	 case 'r':
-	    set_flag_var(reverse_languages,option) ;
-	    break ;
-         case 's':
-	    use_stdin = true ;
-	    break ;
-	 case 'S':
-	    stopwords_file = argv[1]+2 ;
-	    break ;
-	 case 't':
-	    if (option == '=')
-	       threshold_file = argv[1]+3 ;
-	    else
-	       threshold = atof(argv[1]+2) ;
-	    break ;
-	 case 'T':
-	    if (option == '-')
-	       {
-	       reverse_tokens = true ;
-	       input_token_file = argv[1]+3 ;
-	       }
-	    else
-	       input_token_file = argv[1]+2 ;
-	    break ;
-	 case 'v':
-	    verbose = true ;
-	    break ;
-	 case 'w':
-	    weights_file = argv[1]+2 ;
-	    break ;
-	 case 'W':
-	    use_phrasal_context = true ;
-	    if (option == 'W')
-	       single_phrase_context = true ;
-	    break ;
-	 case 'x':
-	    if (option == 'p')
-	       exclude_punctuation = true ;
-	    else if (option == 'n')
-	       exclude_numbers = true ;
-	    break ;
-	 case 'U':
-	    if (option == 'b' && argv[1][3] == '\0')
-	       set_flag_var(Unicode_bswap,argv[1][3]) ;
-	    else
-	       WcSetCharEncoding(argv[1]+2) ;
-	    char_encoding = WcCurrentCharEncoding() ;
-	    break ;
-	 default:
-	    cerr << "Unrecognized option " << argv[1] << endl ;
-	    usage(argv0) ;
-	    break ;
-	 }
-      }
-   if (argc < 3)
-      usage(argv0) ;
+   params.runVerbosely(verbose) ;
+   params.showMemory(showmem) ;
+   WcLowercaseOutput(lowercase_output) ;
+
    const char *output_file = argv[1] ;
-   FILE *out_file = nullptr ;
-   if (output_file && *output_file)
-      out_file = fopen(output_file,"w") ;
-   else
+   if (!output_file || *output_file)
       {
-      FrError("you must specify an output file!") ;
+      SystemMessage::error("you must specify an output file!") ;
       return EXIT_FAILURE ;
       }
-   FILE *tok_file = nullptr ;
-   if (token_file && *token_file)
-      tok_file = fopen(token_file,"w") ;
-   load_stopwords(stopwords_file) ;
-   FILE *tagged_file = nullptr ;
-   if (output_corpus_file && *output_corpus_file)
-      tagged_file = fopen(output_corpus_file,"w") ;
+   COutputFile out_file(output_file) ;
+   COutputFile tok_file(token_file) ;
+   COutputFile tagged_file(output_corpus_file) ;
    // configure library
-   FrObjHashTable *seeds = nullptr ;
+   ScopedObject<SymHashTable> seeds(4000) ;
    if (seed_class_file && *seed_class_file)
       {
       cout << ";[ loading initial equivalences from " << seed_class_file
 	   << " ]" << endl ;
-      seeds = new FrObjHashTable(8000) ;
-#if 1
-      make_seeds(seed_class_file,seeds) ;
-#else
-      Tokenizer *equivalences = new Tokenizer(seed_class_file,
-					      Tokenizer::keepall) ;
-      make_seeds(equivalences,seeds) ;
-      delete equivalences ;
-#endif
+      make_seeds(seed_class_file,seeds,params.runVerbosely()) ;
       }
-   FrThresholdList threshold_list(threshold_file,threshold) ;
    (void)weights_file;//keep compiler happy
 //!!! WcLoadTermWeights(weights_file) ;
    // and finally, run the clustering or grammar generation
-   FrTimer timer ;
-   WcParameters params(min_frequency,max_frequency,max_term_count,
-		       stop_term_count,neighborhood_left,neighborhood_right,
-		       tl_context_l,tl_context_r,phrase_size,min_phrase_MI,0) ;
+   Timer timer ;
+   params.iterations(clustering_iter) ;
+   params.clusteringSettings(clustering_settings) ;
+   params.minWordFreq(min_frequency) ;
+   params.maxWordFreq(max_frequency) ;
+   params.maxTermCount(max_term_count) ;
+   params.stopTermCount(stop_term_count) ;
+   params.phraseLength(phrase_size) ;
+   params.miThreshold(min_phrase_MI) ;
    params.downcaseSource(lowercase_source) ;
-   params.downcaseTarget(lowercase_target) ;
    params.equivalenceClasses(seeds) ;
+   params.stopwordsFile(stopwords_file) ;
+   params.contextEquivClassFile(context_equiv_file) ;
    params.equivClassFile(input_token_file) ;
    params.desiredClusters(desired_clusters) ;
    params.backoffStep(backoff_step) ;
-   WcProcessCorpusFiles(argv[3],use_stdin,out_file,tok_file,tagged_file,&params,
-			&threshold_list) ;
-   // clean up
-   if (out_file)
-      fclose(out_file) ;
-   delete seeds ;
-   cout << ";[ Total run time was " << timer.readsec() << " seconds ]" << endl;
-   unload_WordClus_config() ;
-   if (showmem)
+   params.excludeNumbers(exclude_numbers) ;
+   params.excludePunctuation(exclude_punct) ;
+   WordCorpus *corpus = load_or_generate_corpus(argv[3],&params) ;
+   if (corpus)
       {
-      FrMemoryStats(cerr) ;
-      if (verbose)
+      VectorMeasure<WcWordCorpus::ID,float>* measure = nullptr ; //TODO
+      WcProcessCorpus(corpus,measure,out_file,tok_file,tagged_file,&params,
+		      output_file,token_file,output_corpus_file) ;
+      }
+   // clean up
+   seeds = nullptr ;
+   cout << ";[ Total run time was " << timer << " ]" << endl;
+   if (params.showMemory())
+      {
+      Fr::memory_stats(cerr) ;
+      if (params.runVerbosely())
 	 {
-	 wc_vars.freeVariables() ;
-	 FramepaC_gc() ;
-	 FrMemoryStats(cerr) ;
-	 FrString::dumpUnfreed(cerr) ;
+	 Fr::gc() ;
+	 Fr::memory_stats(cerr) ;
 	 }
       }
    return EXIT_SUCCESS ;

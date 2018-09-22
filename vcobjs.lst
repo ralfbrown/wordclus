@@ -1,2 +1,0 @@
-wcmain.obj wcclust.obj wcthresh.obj wctrmvec.obj wcwrdinf.obj wcconfig.obj
-wcgram.obj wcanalyz.obj wcoutput.obj wcglobal.obj

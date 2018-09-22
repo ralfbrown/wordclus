@@ -4,7 +4,7 @@
 /*  Version 2.00							*/
 /*	 by Ralf Brown							*/
 /*									*/
-/*  File: wcbatch.h	      batch-of-lines processing			*/
+/*  File: wcdelim.C	      word delimiters				*/
 /*  LastEdit: 21sep2018							*/
 /*									*/
 /*  (c) Copyright 2015,2016,2017,2018 Carnegie Mellon University	*/
@@ -22,29 +22,66 @@
 /*									*/
 /************************************************************************/
 
-#ifndef __WCBATCH_H_INCLUDED
-#define __WCBATCH_H_INCLUDED
+#include "wordclus.h"
+#include "framepac/list.h"
 
-#include "framepac/file.h"
-
-/************************************************************************/
-/*	Manifest Constants						*/
-/************************************************************************/
-
-#define WcLINES_PER_BATCH 10000
+using namespace Fr ;
 
 /************************************************************************/
-/*	Types								*/
+/*	Globals							        */
 /************************************************************************/
 
-typedef bool WcProcessFileFunc(const Fr::LineBatch &lines, const WcParameters *params,
-			       va_list args) ;
+static CharPtr word_delimiters { nullptr } ;
 
 /************************************************************************/
+/*	Helper functions						*/
 /************************************************************************/
 
-bool WcProcessFile(Fr::CFile& fp, const WcParameters *params, WcProcessFileFunc *fn, ...) ;
+const char *WcWordDelimiters()
+{
+   return word_delimiters ;
+}
 
-#endif /* !__WCBATCH_H_INCLUDED */
+//----------------------------------------------------------------------
 
-// end of file wcbatch.h //
+void WcSetWordDelimiters(const char *delim)
+{
+   if (delim)
+      {
+      word_delimiters = CharPtr(256,delim,256) ;
+      }
+   else
+      {
+      word_delimiters = nullptr ;
+      }
+   return ;
+}
+
+//----------------------------------------------------------------------
+
+void WcClearWordDelimiters()
+{
+   WcSetWordDelimiters(nullptr) ;
+   return ;
+}
+
+//----------------------------------------------------------------------
+
+static bool is_punctuation(const Object *word)
+{
+   if (!word)
+      return false ;
+   const char* w = word->stringValue() ;
+   return (w && ispunct(w[0]) && w[1] == '\0') ;
+}
+
+//----------------------------------------------------------------------
+
+List* remove_punctuation(List* wordlist)
+{
+   return wordlist->removeIf(is_punctuation) ;
+}
+
+//----------------------------------------------------------------------
+
+// end of file wcdelim.C //
