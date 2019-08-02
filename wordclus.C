@@ -97,12 +97,12 @@ static void banner(ostream &out)
 
 //----------------------------------------------------------------------
 
-static void make_seeds(const char *seed_class_file, SymHashTable *seeds, bool run_verbosely)
+static void make_seeds(const char *seed_clss_file, SymHashTable *seeds, bool run_verbosely)
 {
-   if (seed_class_file && seeds)
+   if (seed_clss_file && seeds)
       {
       size_t count(0) ;
-      CInputFile fp(seed_class_file) ;
+      CInputFile fp(seed_clss_file) ;
       if (fp)
 	 {
 	 SymbolTable* symtab = SymbolTable::current() ;

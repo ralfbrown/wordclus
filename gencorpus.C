@@ -90,7 +90,7 @@ List *load_file_list(const char *listfile)
 
 WcWordCorpus* new_corpus(const WcParameters* params, const char *filename)
 {
-   ScopedPtr<WcWordCorpus> corpus { new WcWordCorpus } ;
+   Owned<WcWordCorpus> corpus ;
    if (!corpus || (filename && !corpus->load(filename)))
       {
       return nullptr ;

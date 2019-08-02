@@ -395,9 +395,9 @@ bool WcContext::makeRightContext(size_t loc, const WcParameters* params)
 	 size_t token_length(find_context_term(m_corpus,loc,params,token)) ;
 	 m_canon_ids[m_contextlength++] = token ;
 	 prev_id = token ;
-	 for (size_t i = 0 ; i < token_length ; ++i)
+	 for (size_t j = 0 ; j < token_length ; ++j)
 	    {
-	    m_ids[m_numIDs++] = m_corpus->getID(loc+i) ;
+	    m_ids[m_numIDs++] = m_corpus->getID(loc+j) ;
 	    }
 	 loc += token_length ;
 	 }
@@ -713,8 +713,6 @@ static void analyze_contexts(const WcWordCorpus* corpus, const WcParameters* par
    cvec_info.ht = ht ;
    progress = new ConsoleProgressIndicator(1,corpus->corpusSize()*maxphrase,50,";   ",";   ") ;
    progress->showElapsedTime(true) ;
-   size_t minfreq = params->minWordFreq() ;
-   auto mi = params->mutualInfoID() ;
    auto enum_fn = [&] (const WcWordCorpus::SufArr*,const WcWordCorpus::ID* key,unsigned keylen, size_t freq,
 		       WcWordCorpus::Index first)
 		     { return make_context_vector(key,keylen,freq,first,&cvec_info) ; } ;
@@ -1147,7 +1145,7 @@ static ClusterInfo* WcFilterClusterMembers(ClusterInfo *clusters, const WcParame
       size_t vecs_after = result->size() ;
       if (vecs_before > vecs_after)
 	 {
-	 cout << ";   eliminated/merged " << (vecs_before-clusters_after) << " of "
+	 cout << ";   eliminated/merged " << (vecs_before-vecs_after) << " of "
 	      << vecs_before << " clusters.\n" ;
 	 }
       }
