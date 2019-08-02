@@ -125,7 +125,7 @@ CFLAGS +=$(SANITIZE)
 CFLAGS +=$(SHAREDLIB)
 CFLAGS +=$(COMPILE_OPTS)
 
-CFLAGEXE = -L$(LIBINSTDIR) $(PROFILE)
+CFLAGEXE = -L./framepac $(PROFILE)
 
 ifeq ($(BUILD_DBG),2)
   CFLAGS += -ggdb3 -O0 -fno-inline -g3
@@ -229,8 +229,9 @@ zip:
 #########################################################################
 ## executables
 
-bin/wordclus$(EXE): build/wordclus$(OBJ) $(LIBRARY)
-	$(CCLINK) $(LINKFLAGS) $(CFLAGEXE) -o $@ $^ -lframepacng
+bin/wordclus$(EXE): build/wordclus$(OBJ) $(LIBRARY) framepac/framepacng.a
+	mkdir -p bin
+	$(CCLINK) $(LINKFLAGS) $(CFLAGEXE) -o $@ $^
 
 $(LIBINSTDIR)/$(LIBRARY): $(LIBRARY)
 	$(CP) $(HEADERS) $(INSTDIR)
