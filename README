@@ -1,0 +1,2 @@
+This version has been rewritten to use the new FramepaC-ng library.  For the older code that used the
+legacy FramepaC library, see the 'legacy' branch.
