@@ -220,7 +220,7 @@ static bool write_cluster(CFile& outfp, const char* source, const WcTermVector* 
       if (freq || left || right)
 	 {
 	 outfp.printf("\t%lu",(unsigned long)freq) ;
-	 if (left || right)
+	 if (*left || *right)
 	    {
 	    CharPtr lstring { make_string(left) } ;
 	    CharPtr rstring { make_string(right) } ;
@@ -254,8 +254,8 @@ void output_cluster(const ClusterInfo* info, CFile& outfp, size_t &total_pairs, 
       if (!tv || !tv->key() /*|| !tv->label()*/)
 	 continue ;
       CharPtr src { extract_source_words(tv->key(),encoding) } ;
-      if (!src)
-	 continue ;
+      if (!src || !*src)		// if no source text,
+	 continue ;			//   then skip
       if (write_cluster(outfp,src,tv))
 	 total_pairs++ ;
       }
@@ -298,7 +298,7 @@ void WcOutputClusters(const ClusterInfo *cluster_info, CFile& outfp, const char 
 static bool output_token(const ClusterInfo *cluster, CFile& outfp, size_t &total_pairs, size_t &total_clusters,
 			 bool suppress_bracket)
 {
-   if (!outfp || !cluster)
+   if (!outfp || !cluster || !cluster->label())
       return false ;
    auto members = sorted_vectors(cluster) ;
    if (!members)
@@ -313,13 +313,13 @@ static bool output_token(const ClusterInfo *cluster, CFile& outfp, size_t &total
       if (!vec || !vec->key() || !vec->label())
 	 continue ;
       CharPtr src { extract_source_words(vec->key(),encoding) } ;
-      if (!src)
-	 continue ;
+      if (!src || !*src)	     	// if no source text,
+	 continue ;			//   then skip
       const char *bracket = suppress_bracket ? "" : need_rightbracket(clus) ;
       outfp.printf("%s\t%s%s",*src,clus,bracket) ;
       const List *left = vec->leftConstraint() ;
       const List *right = vec->rightConstraint() ;
-      if (left || right)
+      if (*left || *right)
 	 {
 	 CharPtr leftstr { make_string(left) } ;
 	 CharPtr rightstr { make_string(right) } ;
@@ -371,12 +371,12 @@ static void output_entry(CFile& outfp, const char* clus, const char* bracket,
       outfp.printf("(FREQ %lu)",(unsigned long)freq) ;
    const List *left = vec->leftConstraint() ;
    const List *right = vec->rightConstraint() ;
-   if (left)
+   if (*left)
       {
       CharPtr leftstr { make_string(left) } ;
       outfp.printf("(LEFT %s)",*leftstr) ;
       }
-   if (right)
+   if (*right)
       {
       CharPtr rightstr { make_string(right) } ;
       outfp.printf("(RIGHT %s)",*rightstr) ;
@@ -405,8 +405,8 @@ static bool output_tagged(const ClusterInfo *cluster, CFile& outfp,
       if (!vec || !vec->key() || !vec->label())
 	 continue ;
       CharPtr src { extract_source_words(vec->key(),char_enc) } ;
-      if (!src)
-	 continue ;
+      if (!src || !*src)		// if no source text,
+	 continue ;			//   then skip
       strip_vertical_bars(src) ;
       const char *bracket = need_rightbracket(clus) ;
       output_entry(outfp,clus,bracket,vec,src,src) ;

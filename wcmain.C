@@ -721,10 +721,10 @@ static void analyze_contexts(const WcWordCorpus* corpus, const WcParameters* par
    auto filter = [=] (const WcWordCorpus::SufArr*, const WcWordCorpus::ID* key, unsigned keylen,
       		      size_t freq, bool all)
 		    {
-		    bool keep = (freq >= minfreq
+		    bool keep = (freq >= params->minWordFreq()
 		       && corpus->hasAttribute(key[0],WcATTR_DESIRED) && corpus->getWord(key[0])
 		       && (all || keylen == 1 || corpus->hasAttribute(key[keylen-1],WcATTR_DESIRED))
-		       && (all || desireable_term(key,keylen,corpus,mi))) ;
+		       && (all || desireable_term(key,keylen,corpus,params->mutualInfoID()))) ;
 		    if (!keep) (*progress) += freq ;
 		    return keep ;
 		    } ;
@@ -1142,13 +1142,13 @@ static ClusterInfo* WcFilterClusterMembers(ClusterInfo *clusters, const WcParame
       }
    if (params.clusterPostprocFunc() && result)
       {
-      size_t clusters_before = result->size() ;
+      size_t vecs_before = result->size() ;
       result = params.clusterPostprocFunc()(result,params.clusterPostprocData()) ;
-      size_t clusters_after = result->size() ;
-      if (clusters_before > clusters_after)
+      size_t vecs_after = result->size() ;
+      if (vecs_before > vecs_after)
 	 {
-	 cout << ";   eliminated/merged " << (clusters_before-clusters_after) << " of "
-	      << clusters_before << " clusters.\n" ;
+	 cout << ";   eliminated/merged " << (vecs_before-clusters_after) << " of "
+	      << vecs_before << " clusters.\n" ;
 	 }
       }
    if (params.runVerbosely())
