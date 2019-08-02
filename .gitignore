@@ -26,3 +26,16 @@
 *.exe
 *.out
 *.app
+
+# Submodules
+/framepac
+
+# Generated files
+/build
+/bin
+*.s
+
+# Backups
+*~
+*.bak
+*.BAK
